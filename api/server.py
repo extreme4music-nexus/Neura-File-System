@@ -107,14 +107,17 @@ def split_audio_into_subbands(pcm_signal: np.ndarray, sample_rate: int, num_band
         low = edges[i] / nyquist
         high = edges[i+1] / nyquist
         
+        # Користење на SOS (Second-Order Sections) за нумеричка стабилност
         if i == 0:
-            b, a = signal.butter(4, high, btype='low')
+            sos = signal.butter(4, high, btype='low', output='sos')
         elif i == num_bands - 1:
-            b, a = signal.butter(4, low, btype='high')
+            sos = signal.butter(4, low, btype='high', output='sos')
         else:
-            b, a = signal.butter(4, [low, high], btype='band')
+            sos = signal.butter(4, [low, high], btype='band', output='sos')
             
-        filtered = signal.filtfilt(b, a, pcm_signal)
+        filtered = signal.sosfiltfilt(sos, pcm_signal)
+        # Клипување за дополнителна заштита од прелив
+        filtered = np.clip(filtered, -2.0, 2.0)
         subbands.append(filtered.astype(np.float32))
 
     return subbands
@@ -676,7 +679,7 @@ async def get_fs_tree():
         for entry in os.scandir(dir_path):
             # 🚫 Целосно игнорирај го .temp и сите скриени фолдери/фајлови кои почнуваат со "."
             if entry.name.startswith("."):
-                continue.
+                continue
 
             item_rel = os.path.join(rel_path, entry.name).replace("\\", "/")
             
