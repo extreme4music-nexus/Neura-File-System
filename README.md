@@ -1,6 +1,50 @@
-# NeuraFS
+# NeuraFS (Neural File System) 🧠💾
 
-## 🚀 What's New in NeuraFS v1.1.0 - Speed & Parallel Neural Overhaul
+**Neural representation-based storage engine. Stable (v1.0.0) **
+
+NeuraFS is an experimental research prototype exploring the paradigm shift from traditional discrete file compression (like ZIP, MP3, MP4) to continuous **Implicit Neural Representations (INRs)**. Instead of storing bits of a file, NeuraFS trains a dynamic neural agent to memorize the data and stores its $FP16$ weights in a highly optimized binary container (`.hcs`).
+
+---
+
+## 🔬 Current Status: Experimental Research Prototype
+**Please note:** This is a research project intended for DSP, Machine Learning, and Codec engineers. It is **not** a production-ready drop-in replacement for standard file systems. The goal is to prove that neural continuous representations can act as a viable, bit-perfect (or perceptually perfect) archival format.
+
+## 💡 Core Concept
+Instead of encoding an audio waveform or a video frame via traditional mathematical transforms (DCT, Wavelets), NeuraFS:
+1. Decomposes the signal using adaptive subband filterbanks.
+2. Trains a **SIREN (Sinusoidal Representation Network)** to map spatio-temporal coordinates $(x, y, t)$ to signal values.
+3. Dynamically adjusts training epochs based on signal complexity (RMS, Spectral Flatness, ZCR) and psychoacoustic masking limits.
+4. Serializes the neural weights into a decoupled `.hcs` (Hyper Compressed Subband) binary container.
+
+## 🏗 Architecture
+NeuraFS decouples the heavy lifting by running concurrent hybrid workflows (Audio on CPU cores, 3D Video on GPU).
+
+```text
+Input Media
+     │
+     ▼
+Media Inspector (FFmpeg)
+     │
+     ├────────────────────────────────────────┐
+     ▼                                        ▼
+DSP Subband Decomposition (CPU)      3D Spatio-Temporal Batching (GPU)
+     │                                        │
+     ▼                                        ▼
+SIREN Neural Agents (Warm-started, adaptive complexity training)
+     │                                        │
+     └──────────────────┬─────────────────────┘
+                        ▼
+            FP16 Weight Serialization
+                        │
+                        ▼
+          HCS1 Binary Container (.hcs)
+                        │
+                        ▼
+          Verification Metrics Agent
+          (SI-SDR, LSD, Spectral Conv)
+
+
+## 🚀 What's New in NeuraFS Beta (v1.0.1) - Speed & Parallel Neural Overhaul
 
 ### ⚡ Key Improvements & Performance Fixes
 
@@ -27,7 +71,7 @@ Rather than competing with consumer streaming codecs (such as MP3, AAC, or Opus)
 
 ---
 
-# NeuraFS — Implicit Neural Archive Engine (v1.0.0)
+# NeuraFS — Implicit Neural Archive Engine Beta (v1.0.0)
 
 
 ## 🌟 Key Features
