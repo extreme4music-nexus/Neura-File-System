@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 
 const SYSTEM_MASTER_KEY = crypto.createHash('sha256').update('NeuraFS_System_Master_Encrypted_Container_Key_2026').digest();
 const CONTAINER_MAGIC_HEADER = Buffer.from('NEURAFS1', 'utf-8');
@@ -29,6 +30,17 @@ function decryptPayloadBuffer(encryptedContainerBuffer) {
     const decipher = crypto.createDecipheriv('aes-256-gcm', SYSTEM_MASTER_KEY, iv);
     decipher.setAuthTag(authTag);
     return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+function unpackPackageBuffer(fileBuffer) {
+    let packageBuffer = (fileBuffer.length >= 36 && fileBuffer.subarray(0, 8).toString('utf-8') === 'NEURAFS1')
+        ? decryptPayloadBuffer(fileBuffer) : fileBuffer;
+
+    try {
+        return zlib.inflateSync(packageBuffer);
+    } catch (e) {
+        return packageBuffer;
+    }
 }
 
 function createWavHeader(dataLength, sampleRate = 44100, channels = 2, bitsPerSample = 16, audioFormat = 1) {
@@ -67,8 +79,7 @@ class HyperCompressorSDK {
     readHcsHeader(hcsFilePath) {
         if (!fs.existsSync(hcsFilePath)) throw new Error(`Package file not found: ${hcsFilePath}`);
         const fileBuffer = fs.readFileSync(hcsFilePath);
-        let packageBuffer = (fileBuffer.length >= 36 && fileBuffer.subarray(0, 8).toString('utf-8') === 'NEURAFS1')
-            ? decryptPayloadBuffer(fileBuffer) : fileBuffer;
+        const packageBuffer = unpackPackageBuffer(fileBuffer);
 
         const headerLength = packageBuffer.readUInt32BE(0);
         return JSON.parse(packageBuffer.subarray(4, 4 + headerLength).toString('utf-8'));
@@ -121,20 +132,25 @@ class HyperCompressorSDK {
                 }
             }
 
+            const chunks = apiResult.subband_units || apiResult.neural_chunks || [];
             const chunksMeta = [];
             let currentOffset = 0;
 
-            for (let idx = 0; idx < apiResult.neural_chunks.length; idx++) {
-                const chunk = apiResult.neural_chunks[idx];
+            for (let idx = 0; idx < chunks.length; idx++) {
+                const chunk = chunks[idx];
                 const chunkBuffer = Buffer.from(chunk.weights_b64, 'base64');
                 binaryPayloadBuffers.push(chunkBuffer);
 
                 chunksMeta.push({
-                    chunk_idx: chunk.chunk_idx,
-                    band_idx: chunk.band_idx || 0,
-                    num_frames: chunk.num_frames,
-                    channels: chunk.channels,
-                    hidden_dim: chunk.hidden_dim,
+                    chunk_idx: idx,
+                    time_slice_idx: chunk.time_slice_idx !== undefined ? chunk.time_slice_idx : idx,
+                    subband_idx: chunk.subband_idx !== undefined ? chunk.subband_idx : 0,
+                    band_idx: chunk.ch_idx !== undefined ? chunk.ch_idx : (chunk.band_idx || 0),
+                    ch_idx: chunk.ch_idx !== undefined ? chunk.ch_idx : 0,
+                    num_frames: chunk.num_samples || chunk.num_frames || 0,
+                    num_samples: chunk.num_samples || chunk.num_frames || 0,
+                    channels: chunk.channels || 1,
+                    hidden_dim: chunk.hidden_dim || 128,
                     offset: currentOffset,
                     length: chunkBuffer.length
                 });
@@ -143,12 +159,12 @@ class HyperCompressorSDK {
             }
 
             headerMeta = {
-                type: 'neural_media',
+                type: apiResult.type || 'neural_media',
                 original_name: originalName,
                 original_size: rawBuffer.length,
                 sample_rate: apiResult.sample_rate || 44100,
                 channels: apiResult.channels || 2,
-                num_bands: apiResult.num_bands || 1,
+                num_bands: apiResult.num_subbands || apiResult.num_bands || 1,
                 precision_mode: precisionMode,
                 created_at: new Date().toISOString(),
                 chunks_info: chunksMeta
@@ -196,7 +212,9 @@ class HyperCompressorSDK {
 
         const payloadBuffer = Buffer.concat(binaryPayloadBuffers);
         const unencryptedPackageBuffer = Buffer.concat([headerLenBuffer, jsonHeaderBuffer, payloadBuffer]);
-        const finalEncryptedContainerBuffer = encryptPayloadBuffer(unencryptedPackageBuffer);
+        
+        const compressedUnencrypted = zlib.deflateSync(unencryptedPackageBuffer);
+        const finalEncryptedContainerBuffer = encryptPayloadBuffer(compressedUnencrypted);
 
         fs.writeFileSync(finalOutputPath, finalEncryptedContainerBuffer);
 
@@ -254,18 +272,24 @@ class HyperCompressorSDK {
                     }
                 }
 
+                const chunks = apiResult.subband_units || apiResult.neural_chunks || [];
                 const chunksMeta = [];
-                for (let idx = 0; idx < apiResult.neural_chunks.length; idx++) {
-                    const chunk = apiResult.neural_chunks[idx];
+
+                for (let idx = 0; idx < chunks.length; idx++) {
+                    const chunk = chunks[idx];
                     const chunkBuffer = Buffer.from(chunk.weights_b64, 'base64');
                     binaryPayloadBuffers.push(chunkBuffer);
 
                     chunksMeta.push({
-                        chunk_idx: chunk.chunk_idx,
-                        band_idx: chunk.band_idx || 0,
-                        num_frames: chunk.num_frames,
-                        channels: chunk.channels,
-                        hidden_dim: chunk.hidden_dim,
+                        chunk_idx: idx,
+                        time_slice_idx: chunk.time_slice_idx !== undefined ? chunk.time_slice_idx : idx,
+                        subband_idx: chunk.subband_idx !== undefined ? chunk.subband_idx : 0,
+                        band_idx: chunk.ch_idx !== undefined ? chunk.ch_idx : (chunk.band_idx || 0),
+                        ch_idx: chunk.ch_idx !== undefined ? chunk.ch_idx : 0,
+                        num_frames: chunk.num_samples || chunk.num_frames || 0,
+                        num_samples: chunk.num_samples || chunk.num_frames || 0,
+                        channels: chunk.channels || 1,
+                        hidden_dim: chunk.hidden_dim || 128,
                         offset: globalOffset,
                         length: chunkBuffer.length
                     });
@@ -276,7 +300,7 @@ class HyperCompressorSDK {
                 manifestFiles.push({
                     relative_path: item.relativePath,
                     original_name: item.originalName,
-                    type: 'neural_media',
+                    type: apiResult.type || 'neural_media',
                     original_size: rawBuffer.length,
                     sample_rate: apiResult.sample_rate || 44100,
                     channels: apiResult.channels || 2,
@@ -333,7 +357,10 @@ class HyperCompressorSDK {
 
         const payloadBuffer = Buffer.concat(binaryPayloadBuffers);
         const unencryptedPackageBuffer = Buffer.concat([headerLenBuffer, jsonHeaderBuffer, payloadBuffer]);
-        const finalEncryptedContainerBuffer = encryptPayloadBuffer(unencryptedPackageBuffer);
+        
+        const compressedUnencrypted = zlib.deflateSync(unencryptedPackageBuffer);
+        const finalEncryptedContainerBuffer = encryptPayloadBuffer(compressedUnencrypted);
+        
         fs.writeFileSync(finalOutputPath, finalEncryptedContainerBuffer);
 
         return {
@@ -349,8 +376,7 @@ class HyperCompressorSDK {
         if (!fs.existsSync(hcsFilePath)) throw new Error(`Package file not found: ${hcsFilePath}`);
 
         const fileBuffer = fs.readFileSync(hcsFilePath);
-        let packageBuffer = (fileBuffer.length >= 36 && fileBuffer.subarray(0, 8).toString('utf-8') === 'NEURAFS1')
-            ? decryptPayloadBuffer(fileBuffer) : fileBuffer;
+        const packageBuffer = unpackPackageBuffer(fileBuffer);
 
         const headerLength = packageBuffer.readUInt32BE(0);
         const header = JSON.parse(packageBuffer.subarray(4, 4 + headerLength).toString('utf-8'));
@@ -362,11 +388,15 @@ class HyperCompressorSDK {
             if (!targetFileMeta) targetFileMeta = header.files[0];
         }
 
-        if (targetFileMeta.type === 'neural_media') {
+        if (targetFileMeta.type === 'neural_media' || targetFileMeta.type === 'neural_video') {
             const apiChunks = targetFileMeta.chunks_info.map(chunkInfo => ({
-                chunk_idx: chunkInfo.chunk_idx,
-                band_idx: chunkInfo.band_idx || 0,
-                num_frames: chunkInfo.num_frames,
+                chunk_idx: chunkInfo.chunk_idx || 0,
+                time_slice_idx: chunkInfo.time_slice_idx !== undefined ? chunkInfo.time_slice_idx : (chunkInfo.chunk_idx || 0),
+                subband_idx: chunkInfo.subband_idx !== undefined ? chunkInfo.subband_idx : (chunkInfo.band_idx || 0),
+                band_idx: chunkInfo.band_idx !== undefined ? chunkInfo.band_idx : (chunkInfo.ch_idx || 0),
+                ch_idx: chunkInfo.ch_idx !== undefined ? chunkInfo.ch_idx : (chunkInfo.band_idx || 0),
+                num_frames: chunkInfo.num_frames || chunkInfo.num_samples || 0,
+                num_samples: chunkInfo.num_samples || chunkInfo.num_frames || 0,
                 channels: chunkInfo.channels || targetFileMeta.channels || 2,
                 hidden_dim: chunkInfo.hidden_dim || 128,
                 weights_b64: payloadBuffer.subarray(chunkInfo.offset, chunkInfo.offset + chunkInfo.length).toString('base64')
@@ -381,6 +411,8 @@ class HyperCompressorSDK {
             if (!response.ok) throw new Error(`API Error [Neural Resynthesis]: ${response.statusText}`);
 
             const result = await response.json();
+            if (!result.pcm_b64) throw new Error(`Resynthesis failed: ${result.message || 'No PCM returned from Python engine'}`);
+
             const rawPcmBuffer = Buffer.from(result.pcm_b64, 'base64');
 
             const wavHeader = createWavHeader(
