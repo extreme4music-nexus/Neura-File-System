@@ -1,0 +1,9 @@
+node_modules/
+sdk/node_modules/
+sdk/config.json
+storage/
+sdk/temp/
+venv/
+/api/venv
+__pycache__/
+*.pyc
