@@ -1,0 +1,16 @@
+# Dockerfile.node
+FROM node:20-alpine
+
+# FFmpeg installed here in case the SDK calls it here
+RUN apk add --no-cache ffmpeg
+
+WORKDIR /workspace/sdk
+
+# Coping of package.json and dependencies installing 
+COPY sdk/package*.json ./
+RUN npm install
+
+WORKDIR /workspace
+
+# Parallel starting of both Node services
+CMD ["sh", "-c", "cd sdk && npm install && node app.js & node benchmark.js"]
