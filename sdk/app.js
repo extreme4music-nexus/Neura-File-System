@@ -104,7 +104,6 @@ function buildDirectoryTree(dirPath, relativePath = '') {
 }
 
 // REST Endpoints
-
 app.get('/api/fs/tree', (req, res) => {
     try {
         const tree = buildDirectoryTree(STORAGE_ROOT);
@@ -151,7 +150,6 @@ app.get('/api/fs/tasks-status', (req, res) => {
     res.json(activeTasks);
 });
 
-// Endpoint for cancelling single or all tasks
 app.post('/api/fs/task-cancel', (req, res) => {
     const { taskId } = req.body;
     if (!taskId) return res.status(400).json({ error: 'taskId is required' });
@@ -179,6 +177,9 @@ app.post('/api/fs/upload-async', upload.any(), async (req, res) => {
 
     const taskId = req.body.taskId || ('task_' + Date.now());
     const precisionMode = req.body.precisionMode || 'auto';
+    const computeDevice = req.body.computeDevice || 'cpu';
+    const parallelEnabled = req.body.parallelEnabled !== 'false';
+
     const relativePaths = [].concat(req.body.relativePaths || req.body.relativePath || []);
     const targetFolder = req.body.targetFolder || 'documents';
     const isFolderBundle = files.length > 1 || relativePaths.length > 0;
@@ -189,8 +190,8 @@ app.post('/api/fs/upload-async', upload.any(), async (req, res) => {
         id: taskId,
         fileName: isFolderBundle ? 'Folder Bundle' : files[0].originalname,
         progress: 5,
-        log: `Initiating Neural Parameterization (Mode: ${precisionMode.toUpperCase()})...`,
-        logsHistory: [`[NeuraFS Node.js] Mode: ${precisionMode.toUpperCase()}`],
+        log: `Initiating Neural Parameterization [Device: ${computeDevice.toUpperCase()} | Parallel: ${parallelEnabled}]...`,
+        logsHistory: [`[NeuraFS Node.js] Mode: ${precisionMode.toUpperCase()} | Device: ${computeDevice.toUpperCase()}`],
         status: 'running'
     };
 
@@ -207,7 +208,7 @@ app.post('/api/fs/upload-async', upload.any(), async (req, res) => {
                 fileName: isFolderBundle ? 'Folder Bundle' : files[0].originalname,
                 progress: progressPercent,
                 log: statusLog,
-                logsHistory: ['[NeuraFS Node.js] Processing Neural/Lossless bands...', ...(pythonLogs || [])],
+                logsHistory: ['[NeuraFS Node.js] Processing Neural Subbands...', ...(pythonLogs || [])],
                 status: 'running'
             };
         };
@@ -220,12 +221,12 @@ app.post('/api/fs/upload-async', upload.any(), async (req, res) => {
                 relativePath: relativePaths[i] || f.originalname
             }));
 
-            await sdk.compressFolderBundle(fileItems, destDir, folderName, taskId, onProgress, precisionMode);
+            await sdk.compressFolderBundle(fileItems, destDir, folderName, taskId, onProgress, precisionMode, computeDevice, parallelEnabled);
             fileItems.forEach(f => { if (fs.existsSync(f.tempFilePath)) fs.unlinkSync(f.tempFilePath); });
 
         } else {
             const file = files[0];
-            await sdk.compressFile(file.path, destDir, file.originalname, taskId, onProgress, precisionMode);
+            await sdk.compressFile(file.path, destDir, file.originalname, taskId, onProgress, precisionMode, computeDevice, parallelEnabled);
             if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
         }
 
