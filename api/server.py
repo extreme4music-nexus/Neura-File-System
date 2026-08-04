@@ -32,7 +32,7 @@ try:
 except RuntimeError:
     pass
 
-# Storage paths setup
+# Safe Storage Paths Setup
 STORAGE_ROOT = os.path.abspath(os.path.join(os.getcwd(), "..", "storage"))
 if not os.path.exists(STORAGE_ROOT):
     STORAGE_ROOT = os.path.abspath(os.path.join(os.getcwd(), "storage"))
@@ -53,6 +53,14 @@ active_process_registry = {}
 
 task_queue = queue.Queue()
 queue_worker_thread = None
+
+def get_safe_path(base_dir: str, req_path: str) -> str:
+    """Validate and sanitize relative file paths against directory traversal."""
+    clean_path = os.path.normpath(req_path).lstrip("/\\")
+    full_path = os.path.abspath(os.path.join(base_dir, clean_path))
+    if not full_path.startswith(os.path.abspath(base_dir)):
+        raise HTTPException(status_code=403, detail="Access denied: Invalid path trajectory.")
+    return full_path
 
 def sanitize_float(val: float, fallback: float = 0.0) -> float:
     if math.isnan(val) or math.isinf(val):
@@ -222,7 +230,6 @@ class SirenSubbandAgent(nn.Module):
         return x
 
 def serialize_agent_fp16(agent: nn.Module) -> str:
-    """Compact Float16 binary serialization."""
     state = {}
     for k, v in agent.state_dict().items():
         arr = v.cpu().numpy().astype(np.float16)
@@ -230,7 +237,6 @@ def serialize_agent_fp16(agent: nn.Module) -> str:
     return base64.b64encode(json.dumps(state).encode('utf-8')).decode('utf-8')
 
 def deserialize_agent_fp16(agent: nn.Module, packed_b64: str):
-    """Unpack Float16 weights into PyTorch agent."""
     raw_json = base64.b64decode(packed_b64).decode('utf-8')
     packed = json.loads(raw_json)
     state_dict = {}
@@ -344,7 +350,7 @@ def isolated_video_worker(frame_idx, frame_data, hidden_dim, device_str, core_id
     except Exception as e:
         print(f"[Video Worker Error]: {e}")
 
-# Master Execution Engine
+# Master Task Processing Function
 def process_task_execution(task_id: str):
     task_info = tasks.get(task_id)
     file_bytes = task_payloads.get(task_id)
@@ -355,21 +361,20 @@ def process_task_execution(task_id: str):
     filename = task_info["filename"]
     precision_mode = task_info["precision_mode"]
     compute_device = task_info["compute_device"]
+    parallel_enabled = task_info.get("parallel_enabled", True)
 
+    manager = mp.Manager()
     try:
         tasks[task_id]["status"] = "running"
         tasks[task_id]["logs"].append(f"[Waveform Analyzer] Analyzing: {filename}")
 
         has_video, has_audio, sample_rate, audio_np, video_frames_np, fps = inspect_and_extract_media(file_bytes, filename)
-
-        # Strictly enforce auto-routing: Media -> media, Everything else -> documents
         target_folder = "media" if (has_video or has_audio) else "documents"
-
         original_size = len(file_bytes)
         result_payload = None
 
         if not has_video and not has_audio:
-            tasks[task_id]["logs"].append(f"[Router] Binary/Document file. LZMA compression engaged.")
+            tasks[task_id]["logs"].append(f"[Router] Binary file. Fast LZMA compression engaged.")
             chunk_size = 256 * 1024
             compressed_chunks = []
             for i in range(0, len(file_bytes), chunk_size):
@@ -386,18 +391,15 @@ def process_task_execution(task_id: str):
 
         else:
             total_logical_cores = os.cpu_count() or 4
-            available_cores = max(1, total_logical_cores - 2)
+            available_cores = max(1, total_logical_cores - 2) if parallel_enabled else 1
             cuda_available = torch.cuda.is_available()
             
-            # Optimized hidden_dim = 32 for true neural compression size (<20% of original)
             hidden_dim = 32 if precision_mode in ['compact', 'auto'] else 48
-            
-            manager = mp.Manager()
             return_dict = manager.dict()
             active_process_registry[task_id] = []
 
             num_subbands = max(1, available_cores)
-            tasks[task_id]["logs"].append(f"[Subband Allocator] Cores: {available_cores} -> Subbands: {num_subbands}")
+            tasks[task_id]["logs"].append(f"[Subband Allocator] Parallel Mode: {parallel_enabled} | Cores: {available_cores} -> Subbands: {num_subbands}")
 
             if has_audio:
                 total_samples, channels = audio_np.shape
@@ -478,11 +480,9 @@ def process_task_execution(task_id: str):
                 "video_units": video_results
             }
 
-        # Save to storage
         save_dir = os.path.join(STORAGE_ROOT, target_folder)
         os.makedirs(save_dir, exist_ok=True)
         container_path = os.path.join(save_dir, f"{filename}.hcs")
-        
         temp_file_path = os.path.join(TEMP_ROOT, f"{task_id}.tmp_raw")
 
         raw_json_bytes = json.dumps(result_payload, ensure_ascii=False).encode('utf-8')
@@ -498,7 +498,6 @@ def process_task_execution(task_id: str):
         hcs_compressed_size = os.path.getsize(container_path)
         comp_ratio = round((1 - (hcs_compressed_size / max(1, original_size))) * 100, 1)
 
-        # Natural process termination
         tasks[task_id]["progress"] = 100
         tasks[task_id]["status"] = "completed"
         tasks[task_id]["result"] = result_payload
@@ -509,6 +508,7 @@ def process_task_execution(task_id: str):
         tasks[task_id]["status"] = "failed"
         tasks[task_id]["logs"].append(f"[Error] {str(e)}")
     finally:
+        manager.shutdown()  # Explicitly shut down multiprocessing manager to prevent leaks
         if task_id in active_process_registry:
             del active_process_registry[task_id]
         if task_id in task_payloads:
@@ -524,7 +524,7 @@ def read_hcs_container(full_hcs_path: str) -> dict:
     except Exception:
         return json.loads(file_bytes.decode('utf-8'))
 
-# REST Models & Endpoints
+# REST Request Models
 class ResynthesisChunkInfo(BaseModel):
     chunk_idx: Optional[int] = 0
     time_slice_idx: Optional[int] = 0
@@ -539,6 +539,12 @@ class ResynthesisChunkInfo(BaseModel):
 
 class ResynthesisRequest(BaseModel):
     chunks: List[ResynthesisChunkInfo]
+
+class BinaryEncodeRequest(BaseModel):
+    chunks_b64: List[str]
+
+class BinaryReconstructRequest(BaseModel):
+    chunks_b64: List[str]
 
 class CancelRequest(BaseModel):
     taskId: str
@@ -556,6 +562,33 @@ async def serve_index():
         with open(index_path, "r", encoding="utf-8") as f:
             return f.read()
     return "<h1>NeuraFS Backend Engine Active</h1>"
+
+# MISSING BINARY ENDPOINTS (ADDED)
+@app.post("/api/v1/encode-lossless-binary")
+async def encode_lossless_binary(req: BinaryEncodeRequest):
+    """Encodes raw chunk buffers into LZMA compressed base64 strings."""
+    try:
+        compressed_chunks = []
+        for ch_b64 in req.chunks_b64:
+            raw_chunk = base64.b64decode(ch_b64)
+            compressed = lzma.compress(raw_chunk, preset=9)
+            compressed_chunks.append(base64.b64encode(compressed).decode('utf-8'))
+        return {"compressed_chunks_b64": compressed_chunks}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Binary encoding failure: {str(e)}")
+
+@app.post("/api/v1/reconstruct-lossless-binary")
+async def reconstruct_lossless_binary(req: BinaryReconstructRequest):
+    """Reconstructs base64 LZMA chunks back to uncompressed base64 data."""
+    try:
+        decompressed_chunks = []
+        for ch_b64 in req.chunks_b64:
+            comp_data = base64.b64decode(ch_b64)
+            decompressed = lzma.decompress(comp_data)
+            decompressed_chunks.append(base64.b64encode(decompressed).decode('utf-8'))
+        return {"decompressed_chunks_b64": decompressed_chunks}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Binary reconstruction failure: {str(e)}")
 
 @app.post("/api/v1/resynthesize-neural-media")
 async def resynthesize_neural_media(req: ResynthesisRequest):
@@ -604,6 +637,12 @@ async def resynthesize_neural_media(req: ResynthesisRequest):
             full_channels.append(np.zeros(100, dtype=np.float32))
 
     audio_resynthesized = np.column_stack(full_channels)
+    
+    # Soft gain scaling to prevent clipping distortion
+    max_val = np.max(np.abs(audio_resynthesized))
+    if max_val > 1.0:
+        audio_resynthesized /= max_val
+
     audio_pcm16 = (np.clip(audio_resynthesized, -1.0, 1.0) * 32767.0).astype(np.int16)
 
     return {
@@ -615,13 +654,12 @@ async def resynthesize_neural_media(req: ResynthesisRequest):
 
 @app.get("/api/fs/stream")
 async def stream_neural_file(path: str):
-    clean_path = os.path.normpath(path).lstrip("/\\")
-    full_hcs_path = os.path.join(STORAGE_ROOT, clean_path)
+    full_hcs_path = get_safe_path(STORAGE_ROOT, path)
     if not full_hcs_path.endswith(".hcs"):
         full_hcs_path += ".hcs"
 
     if not os.path.exists(full_hcs_path):
-        raise HTTPException(status_code=404, detail=f"Container missing: {clean_path}")
+        raise HTTPException(status_code=404, detail=f"Container missing: {path}")
 
     container = read_hcs_container(full_hcs_path)
     c_type = container.get("type")
@@ -675,6 +713,11 @@ async def stream_neural_file(path: str):
                 full_channels.append(np.zeros(100, dtype=np.float32))
 
         audio_resynthesized = np.column_stack(full_channels)
+        
+        max_val = np.max(np.abs(audio_resynthesized))
+        if max_val > 1.0:
+            audio_resynthesized /= max_val
+
         audio_pcm16 = (np.clip(audio_resynthesized, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
         wav_bytes = create_wav_header(audio_pcm16, sample_rate=sample_rate, channels=num_channels)
 
@@ -859,12 +902,13 @@ async def cancel_fs_task(req: CancelRequest):
 
 @app.post("/api/fs/folder")
 async def create_folder(req: FolderRequest):
-    os.makedirs(os.path.join(STORAGE_ROOT, req.folderPath), exist_ok=True)
+    safe_folder = get_safe_path(STORAGE_ROOT, req.folderPath)
+    os.makedirs(safe_folder, exist_ok=True)
     return {"status": "success"}
 
 @app.delete("/api/fs/item")
 async def delete_item(req: DeleteRequest):
-    target = os.path.join(STORAGE_ROOT, req.targetPath)
+    target = get_safe_path(STORAGE_ROOT, req.targetPath)
     if os.path.exists(target + ".hcs"):
         os.remove(target + ".hcs")
     elif os.path.exists(target):
@@ -880,8 +924,7 @@ async def download_raw_file(path: str):
 
 @app.get("/api/fs/download/compressed")
 async def download_compressed_file(path: str):
-    clean_path = os.path.normpath(path).lstrip("/\\")
-    full_hcs_path = os.path.join(STORAGE_ROOT, clean_path)
+    full_hcs_path = get_safe_path(STORAGE_ROOT, path)
     if not full_hcs_path.endswith(".hcs"):
         full_hcs_path += ".hcs"
     if os.path.exists(full_hcs_path):
