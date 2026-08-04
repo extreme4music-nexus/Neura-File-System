@@ -1,0 +1,36 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: neurafs-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    # IF YOU HAVE AN NVIDIA GPU, UNCHECK THIS BLOCK FOR CUDA SUPPORT:    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  sdk:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    container_name: neurafs-sdk
+    ports:
+      - "3000:3000"
+      - "4000:4000"
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    depends_on:
+      - api
+
