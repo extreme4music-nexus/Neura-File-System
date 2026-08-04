@@ -1,0 +1,28 @@
+# Dockerfile.api
+FROM python:3.10-slim
+
+# Инсталација на системски зависности (FFmpeg е клучен за Media Inspector)
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Инсталација на Python библиотеките
+# (Користиме стандардна верзија на PyTorch, FastAPI и потребните парсери за фајлови)
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    pydantic \
+    python-multipart \
+    numpy \
+    scipy \
+    psutil \
+    torch \
+    torchaudio \
+    torchvision
+
+# Изворниот код ќе биде мапиран преку docker-compose
+CMD ["python", "api/server.py"]
