@@ -97,8 +97,13 @@
 
                     <div id="taskLogDropdown" class="hidden absolute right-0 mt-2 w-96 bg-slate-900 text-slate-100 border border-slate-700 rounded-xl shadow-2xl p-4 z-50 text-xs font-mono">
                         <div class="flex justify-between items-center border-b border-slate-700 pb-2 mb-2 font-bold text-sky-400">
-                            <span><i class="fa-solid fa-terminal mr-1"></i> Subband Agent Logs</span>
-                            <span id="activeTaskCount" class="bg-sky-900 text-sky-300 px-2 py-0.5 rounded text-[10px]">0 Active</span>
+                            <span class="flex items-center gap-1.5"><i class="fa-solid fa-terminal text-xs"></i> Subband Logs</span>
+                            <div class="flex items-center gap-2">
+                                <button onclick="cancelAllTasks()" title="Stop all tasks" class="px-2 py-0.5 bg-rose-600/80 hover:bg-rose-600 text-white rounded text-[10px] font-sans font-semibold transition flex items-center gap-1">
+                                    <i class="fa-solid fa-ban text-[10px]"></i> Stop All
+                                </button>
+                                <span id="activeTaskCount" class="bg-sky-900 text-sky-300 px-2 py-0.5 rounded text-[10px]">0 Active</span>
+                            </div>
                         </div>
                         <div id="taskListContainer" class="max-h-60 overflow-y-auto space-y-2 text-[11px] leading-relaxed text-slate-300"></div>
                     </div>
@@ -529,6 +534,35 @@
             localStorage.setItem('neurafs_active_tasks', JSON.stringify(tasks));
         }
 
+        async function cancelTask(taskId) {
+            try {
+                await fetch('/api/fs/task-cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ taskId })
+                });
+                removeTaskFromLocalStorage(taskId);
+                pollTasksStatus();
+            } catch (err) {
+                console.error('Failed to cancel task:', err);
+            }
+        }
+
+        async function cancelAllTasks() {
+            if (!confirm('Are you sure you want to stop all active tasks?')) return;
+            try {
+                await fetch('/api/fs/task-cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ taskId: 'all' })
+                });
+                localStorage.removeItem('neurafs_active_tasks');
+                pollTasksStatus();
+            } catch (err) {
+                console.error('Failed to cancel all tasks:', err);
+            }
+        }
+
         function initBackgroundTasksTracker() {
             if (taskPollInterval) clearInterval(taskPollInterval);
             pollTasksStatus();
@@ -562,7 +596,7 @@
                         saveTaskToLocalStorage(task);
                     }
 
-                    if (task.status === 'completed') {
+                    if (task.status === 'completed' || task.status === 'cancelled') {
                         removeTaskFromLocalStorage(task.id);
                         fetchFileTree();
                         return;
@@ -577,8 +611,13 @@
 
                     taskEl.innerHTML = `
                         <div class="flex justify-between items-center font-bold text-slate-100">
-                            <span class="truncate max-w-[180px]">${task.fileName}</span>
-                            <span class="text-sky-400 font-bold">${task.progress}%</span>
+                            <span class="truncate max-w-[160px]">${task.fileName}</span>
+                            <div class="flex items-center gap-2">
+                                <span class="text-sky-400 font-bold">${task.progress}%</span>
+                                <button onclick="cancelTask('${task.id}')" title="Stop Task" class="text-rose-400 hover:text-rose-300 p-0.5 rounded transition">
+                                    <i class="fa-solid fa-circle-xmark text-sm"></i>
+                                </button>
+                            </div>
                         </div>
                         <div class="w-full bg-slate-800 h-1 rounded-full overflow-hidden my-1">
                             <div class="bg-sky-500 h-full rounded-full transition-all duration-300" style="width: ${task.progress}%"></div>
