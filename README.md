@@ -118,6 +118,33 @@ Rather than competing with consumer streaming codecs (such as MP3, AAC, or Opus)
 * `start.sh` — Automated Linux installer and startup script.
 * `start.bat` — Automated Windows installer and startup script.
 
+📊 Benchmarks
+​Transparency is our priority. We measure not just compression ratios, but rigorous perceptual reconstruction metrics.
+​To run the benchmark suite locally:
+​Place test files in /storage/benchmark_tests/
+​Run the engine: python api/server.py
+​Run the benchmark tool: node sdk/benchmark.js
+​Open http://localhost:4000/benchmark.html
+​Check our Wiki/Discussions for the latest community benchmark tables across FLAC, MP4, and ZIP comparisons.
+​🚧 Limitations
+​Encoding Time: Training neural networks for every file introduces significant encoding latency compared to traditional algorithms.
+​Compute Intensity: Requires substantial CPU/GPU resources for parallel processing.
+​🤝 Contributing & Pull Request Rules
+​We welcome contributions from developers interested in PyTorch, Signal Processing, Codecs, and Neural Fields!
+​main branch: Stable releases only.
+​Feature branches: All PRs must come from a feature branch.
+​PR Requirements:
+​Clear description of the problem solved.
+​Benchmark results (if modifying DSP or SIREN architectures).
+​Backward compatibility analysis (Do NOT break the .hcs binary serialization format without a version migration plan).
+​🗺 Roadmap
+​[x] Adaptive signal complexity training
+​[x] HCS1 decoupled binary container
+​[x] Multi-metric verification (SI-SDR, PSNR, LSD)
+​[ ] Perfect Reconstruction Filter Banks (PRFB)
+​[ ] Psychoacoustic perceptual loss implementation
+​[ ] C++ / Rust bindings for faster decoding
+​Developed by extreme4music-nexus.
 ---
 
 ## 📜 License
