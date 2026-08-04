@@ -32,10 +32,13 @@ try:
 except RuntimeError:
     pass
 
-# Storage paths (Isolated .temp directory inside storage to prevent Node.js VFS race conditions)
-STORAGE_ROOT = os.path.abspath(os.path.join(os.getcwd(), "storage"))
+# Storage paths
+STORAGE_ROOT = os.path.abspath(os.path.join(os.getcwd(), "..", "storage"))
+if not os.path.exists(STORAGE_ROOT):
+    STORAGE_ROOT = os.path.abspath(os.path.join(os.getcwd(), "storage"))
+
 TEMP_ROOT = os.path.join(STORAGE_ROOT, ".temp")
-PUBLIC_DIR = os.path.abspath(os.path.join(os.getcwd(), "storage_public_ui"))
+PUBLIC_DIR = os.path.abspath(os.path.join(os.getcwd(), "..", "public"))
 if not os.path.exists(PUBLIC_DIR):
     PUBLIC_DIR = os.path.abspath(os.path.join(os.getcwd(), "public"))
 
@@ -57,7 +60,7 @@ def sanitize_float(val: float, fallback: float = 0.0) -> float:
     return float(val)
 
 # -------------------------------------------------------------------
-# Queue Lifecycle & Persistent Consumer
+# Queue Lifecycle & Consumer
 # -------------------------------------------------------------------
 function_queue_running = True
 
@@ -82,7 +85,7 @@ async def lifespan(app: FastAPI):
     global function_queue_running
     function_queue_running = False
 
-app = FastAPI(title="NeuraFS Multi-Agent Subband Engine", version="23.0.0", lifespan=lifespan)
+app = FastAPI(title="NeuraFS Compressed Subband Engine", version="24.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -107,7 +110,6 @@ def split_audio_into_subbands(pcm_signal: np.ndarray, sample_rate: int, num_band
         low = edges[i] / nyquist
         high = edges[i+1] / nyquist
         
-        # Користење на SOS (Second-Order Sections) за нумеричка стабилност
         if i == 0:
             sos = signal.butter(4, high, btype='low', output='sos')
         elif i == num_bands - 1:
@@ -116,7 +118,6 @@ def split_audio_into_subbands(pcm_signal: np.ndarray, sample_rate: int, num_band
             sos = signal.butter(4, [low, high], btype='band', output='sos')
             
         filtered = signal.sosfiltfilt(sos, pcm_signal)
-        # Клипување за дополнителна заштита од прелив
         filtered = np.clip(filtered, -2.0, 2.0)
         subbands.append(filtered.astype(np.float32))
 
@@ -183,7 +184,7 @@ def inspect_and_extract_media(file_bytes: bytes, filename: str):
     return has_video, has_audio, sample_rate, audio_np, video_frames_np, fps
 
 # -------------------------------------------------------------------
-# SIREN Subband Neural Architecture
+# SIREN Subband Neural Architecture & Compact Weight Serializer
 # -------------------------------------------------------------------
 class SineLayer(nn.Module):
     def __init__(self, in_features, out_features, bias=True, is_first=False, omega_0=30.0):
@@ -225,6 +226,28 @@ class SirenSubbandAgent(nn.Module):
         for layer in self.net:
             x = layer(x)
         return x
+
+def serialize_agent_fp16(agent: nn.Module) -> str:
+    """Pack PyTorch weights directly to Float16 binary base64 to eliminate overhead."""
+    packed = {}
+    for k, v in agent.state_dict().items():
+        arr = v.cpu().numpy().astype(np.float16)
+        packed[k] = {
+            "shape": list(arr.shape),
+            "data_b64": base64.b64encode(arr.tobytes()).decode('utf-8')
+        }
+    return base64.b64encode(json.dumps(packed).encode('utf-8')).decode('utf-8')
+
+def deserialize_agent_fp16(agent: nn.Module, packed_b64: str):
+    """Unpack Float16 binary base64 weights back into PyTorch model."""
+    raw_json = base64.b64decode(packed_b64).decode('utf-8')
+    packed = json.loads(raw_json)
+    state_dict = {}
+    for k, info in packed.items():
+        raw_bytes = base64.b64decode(info["data_b64"])
+        arr = np.frombuffer(raw_bytes, dtype=np.float16).reshape(info["shape"]).astype(np.float32)
+        state_dict[k] = torch.from_numpy(arr)
+    agent.load_state_dict(state_dict)
 
 # -------------------------------------------------------------------
 # Multiprocessing Subband Worker Functions
@@ -271,10 +294,7 @@ def isolated_subband_worker(time_slice_idx, subband_idx, ch_idx, pcm_subband_dat
             if c_loss < 0.0001 or patience >= 15:
                 break
 
-        state_dict = agent.cpu().state_dict()
-        buf = io.BytesIO()
-        torch.save(state_dict, buf)
-        weights_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        weights_b64 = serialize_agent_fp16(agent)
 
         key = f"sub_{time_slice_idx}_{subband_idx}_{ch_idx}"
         return_dict[key] = {
@@ -321,10 +341,7 @@ def isolated_video_worker(frame_idx, frame_data, hidden_dim, device_str, core_id
             if loss.item() < 0.001:
                 break
 
-        state_dict = agent.cpu().state_dict()
-        buf = io.BytesIO()
-        torch.save(state_dict, buf)
-        weights_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        weights_b64 = serialize_agent_fp16(agent)
 
         return_dict[f"v_{frame_idx}"] = {
             "frame_idx": frame_idx,
@@ -337,7 +354,7 @@ def isolated_video_worker(frame_idx, frame_data, hidden_dim, device_str, core_id
         print(f"[Video Worker Error]: {e}")
 
 # -------------------------------------------------------------------
-# Master Neural Orchestration Engine
+# Master Neural Processing Engine
 # -------------------------------------------------------------------
 def process_task_execution(task_id: str):
     task_info = tasks.get(task_id)
@@ -347,7 +364,6 @@ def process_task_execution(task_id: str):
         return
 
     filename = task_info["filename"]
-    target_folder = task_info.get("targetFolder", "documents")
     precision_mode = task_info["precision_mode"]
     compute_device = task_info["compute_device"]
     parallel_enabled = task_info["parallel_enabled"]
@@ -357,6 +373,9 @@ def process_task_execution(task_id: str):
         tasks[task_id]["logs"].append(f"[Waveform Analyzer] Analyzing input stream: {filename}")
 
         has_video, has_audio, sample_rate, audio_np, video_frames_np, fps = inspect_and_extract_media(file_bytes, filename)
+
+        # Force Media auto-routing rule
+        target_folder = "media" if (has_video or has_audio) else task_info.get("targetFolder", "documents")
 
         original_size = len(file_bytes)
         result_payload = None
@@ -388,14 +407,12 @@ def process_task_execution(task_id: str):
             active_process_registry[task_id] = []
 
             num_subbands = max(1, available_cores)
-            tasks[task_id]["logs"].append(f"[Subband Allocator] Core Budget: {available_cores} Cores -> Splitting audio into {num_subbands} frequency subbands")
+            tasks[task_id]["logs"].append(f"[Subband Allocator] Cores: {available_cores} -> Subbands: {num_subbands}")
 
             if has_audio:
                 total_samples, channels = audio_np.shape
                 slice_samples = int(sample_rate * 2.5)
                 total_slices = math.ceil(total_samples / slice_samples)
-                
-                tasks[task_id]["logs"].append(f"[Time Segmenter] Total Slices: {total_slices} (2.5s each) across {channels} channels")
 
                 all_work_units = []
                 for slice_idx in range(total_slices):
@@ -405,11 +422,10 @@ def process_task_execution(task_id: str):
                     for ch in range(channels):
                         pcm_slice = audio_np[s_start:s_end, ch]
                         subband_signals = split_audio_into_subbands(pcm_slice, sample_rate, num_subbands)
-                        
                         for sb_idx, sb_pcm in enumerate(subband_signals):
                             all_work_units.append((slice_idx, sb_idx, ch, sb_pcm))
 
-                tasks[task_id]["logs"].append(f"[Master Orchestrator] Total Subband Neural Tasks: {len(all_work_units)}")
+                tasks[task_id]["logs"].append(f"[Master Orchestrator] Total Subband Tasks: {len(all_work_units)}")
 
                 for i in range(0, len(all_work_units), available_cores):
                     if tasks.get(task_id, {}).get("status") == "cancelled":
@@ -434,10 +450,10 @@ def process_task_execution(task_id: str):
                     completed = min(i + len(batch), len(all_work_units))
                     progress_pct = int((completed / len(all_work_units)) * (85 if has_video else 95))
                     tasks[task_id]["progress"] = progress_pct
-                    tasks[task_id]["logs"].append(f"   [Subband Agent] Trained {completed}/{len(all_work_units)} subband units ({progress_pct}%)")
+                    tasks[task_id]["logs"].append(f"   [Subband Agent] Processed {completed}/{len(all_work_units)} subband units ({progress_pct}%)")
 
             if has_video:
-                tasks[task_id]["logs"].append(f"[Video Inspector] Video stream detected ({len(video_frames_np)} frames). Dispatching to GPU/CPU workers.")
+                tasks[task_id]["logs"].append(f"[Video Inspector] Video frames: {len(video_frames_np)}. Dispatching to GPU/CPU...")
                 video_device = "cuda" if cuda_available else "cpu"
                 total_frames = len(video_frames_np)
                 frame_batch_size = 4 if video_device == "cuda" else available_cores
@@ -478,27 +494,32 @@ def process_task_execution(task_id: str):
             }
 
         # -----------------------------------------------------------
-        # Isolated Temp File Writing to Prevent Node.js VFS Collisions
+        # LZMA Compressed Container Generation (.hcs)
         # -----------------------------------------------------------
         save_dir = os.path.join(STORAGE_ROOT, target_folder)
         os.makedirs(save_dir, exist_ok=True)
         container_path = os.path.join(save_dir, f"{filename}.hcs")
         
-        # Write to storage_temp using a non-VFS extension .tmp_raw
         temp_file_path = os.path.join(TEMP_ROOT, f"{task_id}.tmp_raw")
 
-        with open(temp_file_path, 'w', encoding='utf-8') as f:
-            json.dump(result_payload, f, ensure_ascii=False)
+        # Serialize JSON payload and compress via LZMA Preset 9
+        raw_json_bytes = json.dumps(result_payload, ensure_ascii=False).encode('utf-8')
+        compressed_hcs_bytes = lzma.compress(raw_json_bytes, preset=9)
+
+        with open(temp_file_path, 'wb') as f:
+            f.write(compressed_hcs_bytes)
             f.flush()
             os.fsync(f.fileno())
 
-        # Move atomically into final VFS destination
         shutil.move(temp_file_path, container_path)
+
+        hcs_compressed_size = os.path.getsize(container_path)
+        comp_ratio = round((1 - (hcs_compressed_size / max(1, original_size))) * 100, 1)
 
         tasks[task_id]["progress"] = 100
         tasks[task_id]["status"] = "completed"
         tasks[task_id]["result"] = result_payload
-        tasks[task_id]["logs"].append(f"[Master Assembler] Neural subband assembly complete! Saved to storage/{target_folder}/{filename}.hcs")
+        tasks[task_id]["logs"].append(f"[Master Assembler] Complete! Saved to storage/{target_folder}/{filename}.hcs (Ratio: {comp_ratio}%)")
 
     except Exception as e:
         print(f"[Task Execution Error]: {traceback.format_exc()}")
@@ -511,7 +532,22 @@ def process_task_execution(task_id: str):
             del task_payloads[task_id]
 
 # -------------------------------------------------------------------
-# REST API Models & Router Endpoints
+# Helper to read LZMA Compressed Container
+# -------------------------------------------------------------------
+def read_hcs_container(full_hcs_path: str) -> dict:
+    with open(full_hcs_path, "rb") as f:
+        file_bytes = f.read()
+
+    try:
+        # Check if LZMA compressed
+        decompressed_bytes = lzma.decompress(file_bytes)
+        return json.loads(decompressed_bytes.decode('utf-8'))
+    except Exception:
+        # Fallback for plain uncompressed JSON
+        return json.loads(file_bytes.decode('utf-8'))
+
+# -------------------------------------------------------------------
+# REST API Endpoints
 # -------------------------------------------------------------------
 class ResynthesisChunkInfo(BaseModel):
     chunk_idx: int
@@ -551,9 +587,7 @@ async def stream_neural_file(path: str):
     if not os.path.exists(full_hcs_path):
         raise HTTPException(status_code=404, detail=f"Container missing: {clean_path}")
 
-    with open(full_hcs_path, "r", encoding="utf-8") as f:
-        container = json.load(f)
-
+    container = read_hcs_container(full_hcs_path)
     c_type = container.get("type")
 
     if c_type in ["neural_media", "neural_video"]:
@@ -584,16 +618,11 @@ async def stream_neural_file(path: str):
 
                 slice_num_samples = units_in_ch[0]["num_samples"]
                 t_coords = torch.linspace(-1.0, 1.0, steps=slice_num_samples).unsqueeze(1)
-                
                 slice_pcm_sum = np.zeros(slice_num_samples, dtype=np.float32)
 
                 for u in units_in_ch:
-                    weights_bytes = base64.b64decode(u["weights_b64"])
-                    buf = io.BytesIO(weights_bytes)
-                    state_dict = torch.load(buf, map_location="cpu")
-
                     agent = SirenSubbandAgent(in_features=1, hidden_features=u["hidden_dim"], hidden_layers=2, out_features=1, omega_0=45.0)
-                    agent.load_state_dict(state_dict)
+                    deserialize_agent_fp16(agent, u["weights_b64"])
                     agent.eval()
 
                     with torch.no_grad():
@@ -624,10 +653,6 @@ async def stream_neural_file(path: str):
         return Response(content=bytes(raw_bytes), media_type="application/octet-stream")
 
     raise HTTPException(status_code=400, detail="Unknown container format")
-
-@app.post("/api/v1/resynthesize-neural-media")
-async def resynthesize_neural_media(req: ResynthesisRequest):
-    return {"status": "success", "message": "Legacy endpoint active"}
 
 @app.post("/api/v1/encode-neural-media-start")
 async def encode_neural_media_start(
@@ -677,7 +702,6 @@ async def get_fs_tree():
             return items
 
         for entry in os.scandir(dir_path):
-            # 🚫 Целосно игнорирај го .temp и сите скриени фолдери/фајлови кои почнуваат со "."
             if entry.name.startswith("."):
                 continue
 
@@ -697,14 +721,12 @@ async def get_fs_tree():
                 file_cat = "media" if orig_name.lower().endswith(('.wav', '.mp3', '.flac', '.mp4', '.mkv', '.avi')) else "document"
 
                 try:
-                    with open(entry.path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        orig_name = data.get("original_filename", orig_name)
-                        orig_size = data.get("original_size", hcs_size)
-                        if data.get("type") in ["neural_media", "neural_video"]:
-                            file_cat = "media"
-                except (json.JSONDecodeError, Exception):
-                    # Прескокни нецелосни или оштетени JSON фајлови
+                    data = read_hcs_container(entry.path)
+                    orig_name = data.get("original_filename", orig_name)
+                    orig_size = data.get("original_size", hcs_size)
+                    if data.get("type") in ["neural_media", "neural_video"]:
+                        file_cat = "media"
+                except Exception:
                     continue
 
                 total_used_bytes += hcs_size
@@ -827,7 +849,7 @@ async def download_compressed_file(path: str):
     if not full_hcs_path.endswith(".hcs"):
         full_hcs_path += ".hcs"
     if os.path.exists(full_hcs_path):
-        return FileResponse(full_hcs_path, media_type="application/json", filename=os.path.basename(full_hcs_path))
+        return FileResponse(full_hcs_path, media_type="application/octet-stream", filename=os.path.basename(full_hcs_path))
     raise HTTPException(status_code=404, detail="Container file not found")
 
 if __name__ == "__main__":
