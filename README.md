@@ -149,4 +149,4 @@ Rather than competing with consumer streaming codecs (such as MP3, AAC, or Opus)
 
 ## 📜 License
 
-Distributed under the MIT License. See `LICENSE.md` for details.
+Distributed under the MIT License. See `LICENSE` for details.
