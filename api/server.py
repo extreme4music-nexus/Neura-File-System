@@ -32,13 +32,15 @@ try:
 except RuntimeError:
     pass
 
-# Storage paths
+# Storage paths (Isolated .temp directory inside storage to prevent Node.js VFS race conditions)
 STORAGE_ROOT = os.path.abspath(os.path.join(os.getcwd(), "storage"))
+TEMP_ROOT = os.path.join(STORAGE_ROOT, ".temp")
 PUBLIC_DIR = os.path.abspath(os.path.join(os.getcwd(), "storage_public_ui"))
 if not os.path.exists(PUBLIC_DIR):
     PUBLIC_DIR = os.path.abspath(os.path.join(os.getcwd(), "public"))
 
 os.makedirs(STORAGE_ROOT, exist_ok=True)
+os.makedirs(TEMP_ROOT, exist_ok=True)
 os.makedirs(os.path.join(STORAGE_ROOT, "documents"), exist_ok=True)
 os.makedirs(os.path.join(STORAGE_ROOT, "media"), exist_ok=True)
 
@@ -49,8 +51,13 @@ active_process_registry = {}
 task_queue = queue.Queue()
 queue_worker_thread = None
 
+def sanitize_float(val: float, fallback: float = 0.0) -> float:
+    if math.isnan(val) or math.isinf(val):
+        return fallback
+    return float(val)
+
 # -------------------------------------------------------------------
-# Queue Lifecycle & Consumer
+# Queue Lifecycle & Persistent Consumer
 # -------------------------------------------------------------------
 function_queue_running = True
 
@@ -75,7 +82,7 @@ async def lifespan(app: FastAPI):
     global function_queue_running
     function_queue_running = False
 
-app = FastAPI(title="NeuraFS Multi-Agent Subband Engine", version="21.0.0", lifespan=lifespan)
+app = FastAPI(title="NeuraFS Multi-Agent Subband Engine", version="23.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -86,13 +93,9 @@ app.add_middleware(
 )
 
 # -------------------------------------------------------------------
-# DSP Subband Filterbank (Frequency Division per Time Slice)
+# DSP Subband Filterbank
 # -------------------------------------------------------------------
 def split_audio_into_subbands(pcm_signal: np.ndarray, sample_rate: int, num_bands: int):
-    """
-    Splits a 1D PCM audio segment into N frequency subbands using Butterworth Bandpass filters.
-    Sum of all subbands reconstructing the original waveform linearly.
-    """
     if num_bands <= 1:
         return [pcm_signal]
 
@@ -105,13 +108,10 @@ def split_audio_into_subbands(pcm_signal: np.ndarray, sample_rate: int, num_band
         high = edges[i+1] / nyquist
         
         if i == 0:
-            # Lowpass for lowest subband
             b, a = signal.butter(4, high, btype='low')
         elif i == num_bands - 1:
-            # Highpass for highest subband
             b, a = signal.butter(4, low, btype='high')
         else:
-            # Bandpass
             b, a = signal.butter(4, [low, high], btype='band')
             
         filtered = signal.filtfilt(b, a, pcm_signal)
@@ -180,7 +180,7 @@ def inspect_and_extract_media(file_bytes: bytes, filename: str):
     return has_video, has_audio, sample_rate, audio_np, video_frames_np, fps
 
 # -------------------------------------------------------------------
-# SIREN Subband Agent Neural Architecture
+# SIREN Subband Neural Architecture
 # -------------------------------------------------------------------
 class SineLayer(nn.Module):
     def __init__(self, in_features, out_features, bias=True, is_first=False, omega_0=30.0):
@@ -224,7 +224,7 @@ class SirenSubbandAgent(nn.Module):
         return x
 
 # -------------------------------------------------------------------
-# Isolated Multiprocessing Audio Subband Worker with Quality Inspector
+# Multiprocessing Subband Worker Functions
 # -------------------------------------------------------------------
 def isolated_subband_worker(time_slice_idx, subband_idx, ch_idx, pcm_subband_data, sample_rate, hidden_dim, device_str, core_id, return_dict):
     try:
@@ -242,13 +242,11 @@ def isolated_subband_worker(time_slice_idx, subband_idx, ch_idx, pcm_subband_dat
         t_coords = torch.linspace(-1.0, 1.0, steps=num_samples, device=device).unsqueeze(1)
         target_tensor = torch.from_numpy(pcm_subband_data).float().to(device).unsqueeze(1)
 
-        # Higher omega_0 for accurate subband transient fitting
         agent = SirenSubbandAgent(in_features=1, hidden_features=hidden_dim, hidden_layers=2, out_features=1, omega_0=45.0).to(device)
         optimizer = torch.optim.Adam(agent.parameters(), lr=1e-3)
         criterion = nn.MSELoss()
 
-        # Quality Inspector Loop (Ensures subband loss reaches fidelity threshold)
-        best_loss = float('inf')
+        best_loss = 0.999
         patience = 0
         for step in range(150):
             optimizer.zero_grad()
@@ -258,6 +256,9 @@ def isolated_subband_worker(time_slice_idx, subband_idx, ch_idx, pcm_subband_dat
             optimizer.step()
 
             c_loss = loss.item()
+            if math.isnan(c_loss) or math.isinf(c_loss):
+                continue
+
             if c_loss < best_loss - 1e-5:
                 best_loss = c_loss
                 patience = 0
@@ -279,7 +280,7 @@ def isolated_subband_worker(time_slice_idx, subband_idx, ch_idx, pcm_subband_dat
             "ch_idx": ch_idx,
             "num_samples": num_samples,
             "hidden_dim": hidden_dim,
-            "loss": best_loss,
+            "loss": sanitize_float(best_loss, 0.0),
             "weights_b64": weights_b64
         }
     except Exception as e:
@@ -383,15 +384,11 @@ def process_task_execution(task_id: str):
             return_dict = manager.dict()
             active_process_registry[task_id] = []
 
-            # -----------------------------------------------------------
-            # MULTI-AGENT AUDIO SUBBAND DECOMPOSITION
-            # -----------------------------------------------------------
             num_subbands = max(1, available_cores)
             tasks[task_id]["logs"].append(f"[Subband Allocator] Core Budget: {available_cores} Cores -> Splitting audio into {num_subbands} frequency subbands")
 
             if has_audio:
                 total_samples, channels = audio_np.shape
-                # 1. Temporal Segmentation (2.5 second time slices)
                 slice_samples = int(sample_rate * 2.5)
                 total_slices = math.ceil(total_samples / slice_samples)
                 
@@ -404,7 +401,6 @@ def process_task_execution(task_id: str):
                     
                     for ch in range(channels):
                         pcm_slice = audio_np[s_start:s_end, ch]
-                        # 2. Split slice into Subbands
                         subband_signals = split_audio_into_subbands(pcm_slice, sample_rate, num_subbands)
                         
                         for sb_idx, sb_pcm in enumerate(subband_signals):
@@ -412,7 +408,6 @@ def process_task_execution(task_id: str):
 
                 tasks[task_id]["logs"].append(f"[Master Orchestrator] Total Subband Neural Tasks: {len(all_work_units)}")
 
-                # Process Subband Workers in Core Batches
                 for i in range(0, len(all_work_units), available_cores):
                     if tasks.get(task_id, {}).get("status") == "cancelled":
                         return
@@ -438,10 +433,6 @@ def process_task_execution(task_id: str):
                     tasks[task_id]["progress"] = progress_pct
                     tasks[task_id]["logs"].append(f"   [Subband Agent] Trained {completed}/{len(all_work_units)} subband units ({progress_pct}%)")
 
-            # -----------------------------------------------------------
-            # PARALLEL VIDEO PARALLELISM (GPU CUDA / CPU)
-            # -----------------------------------------------------------
-            video_units = []
             if has_video:
                 tasks[task_id]["logs"].append(f"[Video Inspector] Video stream detected ({len(video_frames_np)} frames). Dispatching to GPU/CPU workers.")
                 video_device = "cuda" if cuda_available else "cpu"
@@ -483,18 +474,28 @@ def process_task_execution(task_id: str):
                 "video_units": video_results
             }
 
-        # Save manifest
+        # -----------------------------------------------------------
+        # Isolated Temp File Writing to Prevent Node.js VFS Collisions
+        # -----------------------------------------------------------
         save_dir = os.path.join(STORAGE_ROOT, target_folder)
         os.makedirs(save_dir, exist_ok=True)
         container_path = os.path.join(save_dir, f"{filename}.hcs")
+        
+        # Write to storage_temp using a non-VFS extension .tmp_raw
+        temp_file_path = os.path.join(TEMP_ROOT, f"{task_id}.tmp_raw")
 
-        with open(container_path, 'w', encoding='utf-8') as f:
-            json.dump(result_payload, f)
+        with open(temp_file_path, 'w', encoding='utf-8') as f:
+            json.dump(result_payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Move atomically into final VFS destination
+        shutil.move(temp_file_path, container_path)
 
         tasks[task_id]["progress"] = 100
         tasks[task_id]["status"] = "completed"
         tasks[task_id]["result"] = result_payload
-        tasks[task_id]["logs"].append(f"[Master Assembler] Neural subband assembly complete! Saved to {target_folder}/{filename}.hcs")
+        tasks[task_id]["logs"].append(f"[Master Assembler] Neural subband assembly complete! Saved to storage/{target_folder}/{filename}.hcs")
 
     except Exception as e:
         print(f"[Task Execution Error]: {traceback.format_exc()}")
@@ -507,7 +508,7 @@ def process_task_execution(task_id: str):
             del task_payloads[task_id]
 
 # -------------------------------------------------------------------
-# REST API Data Models & Routes
+# REST API Models & Router Endpoints
 # -------------------------------------------------------------------
 class ResynthesisChunkInfo(BaseModel):
     chunk_idx: int
@@ -537,9 +538,6 @@ async def serve_index():
             return f.read()
     return "<h1>NeuraFS Backend Engine Active</h1>"
 
-# -------------------------------------------------------------------
-# High-Fidelity Audio Resynthesis Engine
-# -------------------------------------------------------------------
 @app.get("/api/fs/stream")
 async def stream_neural_file(path: str):
     clean_path = os.path.normpath(path).lstrip("/\\")
@@ -563,7 +561,6 @@ async def stream_neural_file(path: str):
         if not subband_units:
             raise HTTPException(status_code=400, detail="Corrupted subband container")
 
-        # Group by Time Slice -> Channel -> Subbands
         slices_dict = {}
         for unit in subband_units:
             ts = unit["time_slice_idx"]
@@ -585,7 +582,6 @@ async def stream_neural_file(path: str):
                 slice_num_samples = units_in_ch[0]["num_samples"]
                 t_coords = torch.linspace(-1.0, 1.0, steps=slice_num_samples).unsqueeze(1)
                 
-                # Sum subbands to linearly reconstruct full spectral waveform of slice
                 slice_pcm_sum = np.zeros(slice_num_samples, dtype=np.float32)
 
                 for u in units_in_ch:
@@ -603,7 +599,6 @@ async def stream_neural_file(path: str):
 
                 resynthesized_channels[ch_idx].append(slice_pcm_sum)
 
-        # Concatenate time slices for each channel
         full_channels = []
         for ch_idx in range(num_channels):
             if resynthesized_channels[ch_idx]:
@@ -679,7 +674,12 @@ async def get_fs_tree():
             return items
 
         for entry in os.scandir(dir_path):
+            # 🚫 Целосно игнорирај го .temp и сите скриени фолдери/фајлови кои почнуваат со "."
+            if entry.name.startswith("."):
+                continue.
+
             item_rel = os.path.join(rel_path, entry.name).replace("\\", "/")
+            
             if entry.is_dir():
                 items.append({
                     "name": entry.name,
@@ -689,7 +689,6 @@ async def get_fs_tree():
                 })
             elif entry.name.endswith(".hcs"):
                 hcs_size = entry.stat().st_size
-                total_used_bytes += hcs_size
                 orig_name = entry.name[:-4]
                 orig_size = hcs_size * 2
                 file_cat = "media" if orig_name.lower().endswith(('.wav', '.mp3', '.flac', '.mp4', '.mkv', '.avi')) else "document"
@@ -701,9 +700,11 @@ async def get_fs_tree():
                         orig_size = data.get("original_size", hcs_size)
                         if data.get("type") in ["neural_media", "neural_video"]:
                             file_cat = "media"
-                except Exception:
-                    pass
+                except (json.JSONDecodeError, Exception):
+                    # Прескокни нецелосни или оштетени JSON фајлови
+                    continue
 
+                total_used_bytes += hcs_size
                 ratio = f"{round((1 - (hcs_size / max(1, orig_size))) * 100, 1)}%" if orig_size > hcs_size else "1:1"
 
                 items.append({
