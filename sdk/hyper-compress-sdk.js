@@ -115,7 +115,7 @@ class HyperCompressorSDK {
 
             let apiResult = null;
             while (true) {
-                await new Promise(r => setTimeout(r, 600));
+                await new Promise(r => setTimeout(r, 500));
                 const statusRes = await fetch(`${this.apiBaseUrl}/api/v1/task-status/${taskId}`);
                 const statusData = await statusRes.json();
 
@@ -150,7 +150,7 @@ class HyperCompressorSDK {
                     num_frames: chunk.num_samples || chunk.num_frames || 0,
                     num_samples: chunk.num_samples || chunk.num_frames || 0,
                     channels: chunk.channels || 1,
-                    hidden_dim: chunk.hidden_dim || 128,
+                    hidden_dim: chunk.hidden_dim || 32,
                     offset: currentOffset,
                     length: chunkBuffer.length
                 });
@@ -260,7 +260,7 @@ class HyperCompressorSDK {
 
                 let apiResult = null;
                 while (true) {
-                    await new Promise(r => setTimeout(r, 600));
+                    await new Promise(r => setTimeout(r, 500));
                     const statusRes = await fetch(`${this.apiBaseUrl}/api/v1/task-status/${taskId}_file_${i}`);
                     const statusData = await statusRes.json();
 
@@ -289,7 +289,7 @@ class HyperCompressorSDK {
                         num_frames: chunk.num_samples || chunk.num_frames || 0,
                         num_samples: chunk.num_samples || chunk.num_frames || 0,
                         channels: chunk.channels || 1,
-                        hidden_dim: chunk.hidden_dim || 128,
+                        hidden_dim: chunk.hidden_dim || 32,
                         offset: globalOffset,
                         length: chunkBuffer.length
                     });
@@ -398,7 +398,7 @@ class HyperCompressorSDK {
                 num_frames: chunkInfo.num_frames || chunkInfo.num_samples || 0,
                 num_samples: chunkInfo.num_samples || chunkInfo.num_frames || 0,
                 channels: chunkInfo.channels || targetFileMeta.channels || 2,
-                hidden_dim: chunkInfo.hidden_dim || 128,
+                hidden_dim: chunkInfo.hidden_dim || 32,
                 weights_b64: payloadBuffer.subarray(chunkInfo.offset, chunkInfo.offset + chunkInfo.length).toString('base64')
             }));
 
