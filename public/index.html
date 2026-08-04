@@ -41,6 +41,14 @@
             -webkit-user-select: none;
             user-select: none;
         }
+        /* Custom Resizable Floating Panel styling */
+        .detached-panel {
+            position: fixed !important;
+            z-index: 9999 !important;
+            resize: both !important;
+            overflow: auto !important;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5) !important;
+        }
     </style>
 </head>
 <body class="bg-slate-50 text-slate-800 font-sans h-screen flex flex-col no-select">
@@ -66,12 +74,28 @@
                 </div>
             </div>
 
-            <!-- Precision Selector & Main Actions -->
-            <div class="flex items-center gap-3">
+            <!-- Precision, Hardware & Parallel Action Selectors -->
+            <div class="flex items-center gap-2.5">
 
-                <!-- Mode Selector Dropdown -->
+                <!-- Compute Device Dropdown -->
                 <div class="flex items-center gap-1 bg-slate-100 border border-slate-200 rounded-lg p-1">
-                    <i class="fa-solid fa-sliders text-sky-600 text-xs ml-2"></i>
+                    <i class="fa-solid fa-microchip text-indigo-600 text-xs ml-1.5"></i>
+                    <select id="computeDeviceSelect" onchange="saveHardwareSettings()" class="bg-transparent text-slate-700 text-xs font-bold py-1 px-1 focus:outline-none cursor-pointer">
+                        <option value="cpu" selected>CPU Multi-Core</option>
+                        <option value="cuda">GPU (CUDA Acceleration)</option>
+                    </select>
+                </div>
+
+                <!-- Parallel Neural Toggle Button -->
+                <label class="flex items-center gap-1.5 bg-slate-100 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-700 cursor-pointer hover:bg-slate-200 transition">
+                    <input type="checkbox" id="parallelToggle" onchange="saveHardwareSettings()" checked class="rounded text-sky-600 focus:ring-sky-500 w-3.5 h-3.5 cursor-pointer">
+                    <i class="fa-solid fa-network-wired text-sky-600 text-xs"></i>
+                    <span>Parallel Neural</span>
+                </label>
+
+                <!-- Precision Mode Selector Dropdown -->
+                <div class="flex items-center gap-1 bg-slate-100 border border-slate-200 rounded-lg p-1">
+                    <i class="fa-solid fa-sliders text-sky-600 text-xs ml-1.5"></i>
                     <select id="precisionModeSelect" class="bg-transparent text-slate-700 text-xs font-bold py-1 px-1 focus:outline-none cursor-pointer">
                         <option value="auto" selected>Auto (Smart Neural Allocation)</option>
                         <option value="archive">Archive Mode (FP32 - Studio Fidelity)</option>
@@ -79,7 +103,7 @@
                     </select>
                 </div>
 
-                <!-- Progress Widget -->
+                <!-- Progress Widget Button -->
                 <div id="taskProgressWidget" class="hidden relative">
                     <div onclick="toggleTaskDropdown()" class="flex items-center gap-3 bg-slate-100 hover:bg-slate-200 border border-slate-200 px-3 py-1.5 rounded-lg cursor-pointer transition">
                         <div class="w-4 h-4 border-2 border-sky-600 border-t-transparent rounded-full animate-spin"></div>
@@ -95,17 +119,24 @@
                         <i class="fa-solid fa-chevron-down text-xs text-slate-400 ml-1"></i>
                     </div>
 
-                    <div id="taskLogDropdown" class="hidden absolute right-0 mt-2 w-96 bg-slate-900 text-slate-100 border border-slate-700 rounded-xl shadow-2xl p-4 z-50 text-xs font-mono">
-                        <div class="flex justify-between items-center border-b border-slate-700 pb-2 mb-2 font-bold text-sky-400">
-                            <span class="flex items-center gap-1.5"><i class="fa-solid fa-terminal text-xs"></i> Subband Logs</span>
+                    <!-- Detachable & Resizable Task Dropdown Panel -->
+                    <div id="taskLogDropdown" class="hidden absolute right-0 mt-2 w-96 bg-slate-900 text-slate-100 border border-slate-700 rounded-xl p-4 z-50 text-xs font-mono">
+                        <div id="taskLogHeader" class="flex justify-between items-center border-b border-slate-700 pb-2 mb-2 font-bold text-sky-400 select-none">
+                            <span class="flex items-center gap-1.5 cursor-move" title="Drag to move when floating">
+                                <i class="fa-solid fa-terminal text-xs"></i> Subband Logs
+                            </span>
                             <div class="flex items-center gap-2">
+                                <button onclick="toggleDetachWidget()" id="btnDetach" title="Float/Detach Widget Window" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600 rounded text-[10px] font-sans font-semibold transition flex items-center gap-1">
+                                    <i id="detachIcon" class="fa-solid fa-up-right-from-square text-[10px]"></i>
+                                    <span id="detachText">Float</span>
+                                </button>
                                 <button onclick="cancelAllTasks()" title="Stop all tasks" class="px-2 py-0.5 bg-rose-600/80 hover:bg-rose-600 text-white rounded text-[10px] font-sans font-semibold transition flex items-center gap-1">
                                     <i class="fa-solid fa-ban text-[10px]"></i> Stop All
                                 </button>
                                 <span id="activeTaskCount" class="bg-sky-900 text-sky-300 px-2 py-0.5 rounded text-[10px]">0 Active</span>
                             </div>
                         </div>
-                        <div id="taskListContainer" class="max-h-60 overflow-y-auto space-y-2 text-[11px] leading-relaxed text-slate-300"></div>
+                        <div id="taskListContainer" class="max-h-80 overflow-y-auto space-y-2 text-[11px] leading-relaxed text-slate-300 pr-1"></div>
                     </div>
                 </div>
 
@@ -249,13 +280,124 @@
         let monacoEditor = null;
         let taskPollInterval = null;
 
+        // Detach & Draggable Panel States
+        let isDetached = false;
+        let isDragging = false;
+        let dragStartX = 0, dragStartY = 0;
+        let panelInitialLeft = 0, panelInitialTop = 0;
+
         require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.38.0/min/vs' } });
 
         document.addEventListener('DOMContentLoaded', () => {
+            loadHardwareSettings();
             setupContextMenuListeners();
             fetchFileTree();
             initBackgroundTasksTracker();
+            setupDraggableHeader();
         });
+
+        // -------------------------------------------------------------
+        // Settings Persistence Logic (LocalStorage)
+        // -------------------------------------------------------------
+        function loadHardwareSettings() {
+            const savedDevice = localStorage.getItem('neurafs_compute_device') || 'cpu';
+            const savedParallel = localStorage.getItem('neurafs_parallel_enabled');
+
+            document.getElementById('computeDeviceSelect').value = savedDevice;
+            document.getElementById('parallelToggle').checked = (savedParallel === null) ? true : (savedParallel === 'true');
+
+            // Restore Float/Detach mode if user left it detached
+            const savedDetached = localStorage.getItem('neurafs_widget_detached') === 'true';
+            if (savedDetached) {
+                toggleDetachWidget(true);
+            }
+        }
+
+        function saveHardwareSettings() {
+            const deviceVal = document.getElementById('computeDeviceSelect').value;
+            const parallelVal = document.getElementById('parallelToggle').checked;
+
+            localStorage.setItem('neurafs_compute_device', deviceVal);
+            localStorage.setItem('neurafs_parallel_enabled', parallelVal);
+        }
+
+        // -------------------------------------------------------------
+        // Detach & Drag/Resize Floating Panel Logic
+        // -------------------------------------------------------------
+        function toggleDetachWidget(forceState = null) {
+            const panel = document.getElementById('taskLogDropdown');
+            const btnText = document.getElementById('detachText');
+            const btnIcon = document.getElementById('detachIcon');
+
+            isDetached = (forceState !== null) ? forceState : !isDetached;
+            localStorage.setItem('neurafs_widget_detached', isDetached);
+
+            if (isDetached) {
+                panel.classList.remove('absolute', 'right-0', 'mt-2', 'w-96');
+                panel.classList.add('detached-panel');
+                panel.style.top = '100px';
+                panel.style.right = '40px';
+                panel.style.width = '460px';
+                panel.style.height = '380px';
+                panel.style.minWidth = '320px';
+                panel.style.minHeight = '220px';
+                panel.classList.remove('hidden');
+
+                if (btnText) btnText.innerText = 'Dock';
+                if (btnIcon) btnIcon.className = 'fa-solid fa-down-left-and-up-right-to-center text-[10px]';
+            } else {
+                panel.classList.remove('detached-panel');
+                panel.classList.add('absolute', 'right-0', 'mt-2', 'w-96');
+                panel.style.top = '';
+                panel.style.right = '';
+                panel.style.left = '';
+                panel.style.width = '';
+                panel.style.height = '';
+                panel.style.minWidth = '';
+                panel.style.minHeight = '';
+
+                if (btnText) btnText.innerText = 'Float';
+                if (btnIcon) btnIcon.className = 'fa-solid fa-up-right-from-square text-[10px]';
+            }
+        }
+
+        function setupDraggableHeader() {
+            const header = document.getElementById('taskLogHeader');
+            const panel = document.getElementById('taskLogDropdown');
+
+            header.addEventListener('mousedown', (e) => {
+                if (!isDetached) return;
+                // Ignore if clicked on buttons inside header
+                if (e.target.closest('button')) return;
+
+                isDragging = true;
+                dragStartX = e.clientX;
+                dragStartY = e.clientY;
+
+                const rect = panel.getBoundingClientRect();
+                panelInitialLeft = rect.left;
+                panelInitialTop = rect.top;
+
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+            });
+
+            function onMouseMove(e) {
+                if (!isDragging) return;
+                const dx = e.clientX - dragStartX;
+                const dy = e.clientY - dragStartY;
+
+                panel.style.left = `${panelInitialLeft + dx}px`;
+                panel.style.top = `${panelInitialTop + dy}px`;
+                panel.style.right = 'auto'; // Break CSS right pin
+            }
+
+            function onMouseUp() {
+                isDragging = false;
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+            }
+        }
 
         function formatBytes(bytes) {
             if (!bytes || bytes === 0) return '0 B';
@@ -463,6 +605,8 @@
         async function uploadFilesBatch(files, isFolder = false) {
             const selectedFolder = currentPath || 'documents';
             const precisionMode = document.getElementById('precisionModeSelect').value;
+            const computeDevice = document.getElementById('computeDeviceSelect').value;
+            const parallelEnabled = document.getElementById('parallelToggle').checked;
 
             if (isFolder && files.length > 1) {
                 const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
@@ -470,6 +614,8 @@
                 formData.append('targetFolder', selectedFolder);
                 formData.append('taskId', taskId);
                 formData.append('precisionMode', precisionMode);
+                formData.append('computeDevice', computeDevice);
+                formData.append('parallelEnabled', parallelEnabled);
 
                 for (let i = 0; i < files.length; i++) {
                     formData.append('files', files[i]);
@@ -480,7 +626,7 @@
                     id: taskId,
                     fileName: files[0].webkitRelativePath ? files[0].webkitRelativePath.split('/')[0] : 'Folder Bundle',
                     progress: 5,
-                    log: `Initiating Folder Bundle (${precisionMode.toUpperCase()})...`,
+                    log: `Initiating Folder Bundle [Device: ${computeDevice.toUpperCase()} | Parallel: ${parallelEnabled}]...`,
                     status: 'running'
                 });
 
@@ -497,12 +643,14 @@
                     formData.append('targetFolder', selectedFolder);
                     formData.append('taskId', taskId);
                     formData.append('precisionMode', precisionMode);
+                    formData.append('computeDevice', computeDevice);
+                    formData.append('parallelEnabled', parallelEnabled);
 
                     saveTaskToLocalStorage({
                         id: taskId,
                         fileName: file.name,
                         progress: 5,
-                        log: `Initiating (${precisionMode.toUpperCase()})...`,
+                        log: `Initiating [Device: ${computeDevice.toUpperCase()} | Parallel: ${parallelEnabled}]...`,
                         status: 'running'
                     });
 
@@ -532,6 +680,10 @@
             let tasks = JSON.parse(localStorage.getItem('neurafs_active_tasks') || '[]');
             tasks = tasks.filter(t => t.id !== taskId);
             localStorage.setItem('neurafs_active_tasks', JSON.stringify(tasks));
+            
+            // Remove from DOM if exists
+            const el = document.getElementById(`task_row_${taskId}`);
+            if (el) el.remove();
         }
 
         async function cancelTask(taskId) {
@@ -557,6 +709,7 @@
                     body: JSON.stringify({ taskId: 'all' })
                 });
                 localStorage.removeItem('neurafs_active_tasks');
+                document.getElementById('taskListContainer').innerHTML = '';
                 pollTasksStatus();
             } catch (err) {
                 console.error('Failed to cancel all tasks:', err);
@@ -569,6 +722,9 @@
             taskPollInterval = setInterval(pollTasksStatus, 1000);
         }
 
+        // -------------------------------------------------------------
+        // Targeted DOM Update Logic & Permanent Scroll Preservation
+        // -------------------------------------------------------------
         async function pollTasksStatus() {
             let localTasks = getTasksFromLocalStorage();
             if (localTasks.length === 0) {
@@ -584,7 +740,6 @@
                 let activeCount = 0;
                 let overallProgress = 0;
                 const taskContainer = document.getElementById('taskListContainer');
-                taskContainer.innerHTML = '';
 
                 localTasks.forEach(task => {
                     const serverInfo = serverTasks[task.id];
@@ -605,28 +760,54 @@
                     activeCount++;
                     overallProgress += task.progress;
 
-                    const taskEl = document.createElement('div');
-                    taskEl.className = 'p-2 border-b border-slate-800 space-y-1';
-                    let logsHtml = (task.logsHistory || []).map(l => `<div class="text-[10px] text-sky-300 font-mono truncate">${l}</div>`).join('');
+                    // DOM Diffing: Update existing element in-place to NEVER reset scroll position
+                    let taskEl = document.getElementById(`task_row_${task.id}`);
+                    const logsHtml = (task.logsHistory || []).map(l => `<div class="text-[10px] text-sky-300 font-mono truncate">${l}</div>`).join('');
 
-                    taskEl.innerHTML = `
-                        <div class="flex justify-between items-center font-bold text-slate-100">
-                            <span class="truncate max-w-[160px]">${task.fileName}</span>
-                            <div class="flex items-center gap-2">
-                                <span class="text-sky-400 font-bold">${task.progress}%</span>
-                                <button onclick="cancelTask('${task.id}')" title="Stop Task" class="text-rose-400 hover:text-rose-300 p-0.5 rounded transition">
-                                    <i class="fa-solid fa-circle-xmark text-sm"></i>
-                                </button>
+                    if (!taskEl) {
+                        // Create New Task Element
+                        taskEl = document.createElement('div');
+                        taskEl.id = `task_row_${task.id}`;
+                        taskEl.className = 'p-2 border-b border-slate-800 space-y-1';
+                        taskEl.innerHTML = `
+                            <div class="flex justify-between items-center font-bold text-slate-100">
+                                <span class="truncate max-w-[160px]">${task.fileName}</span>
+                                <div class="flex items-center gap-2">
+                                    <span id="task_pct_${task.id}" class="text-sky-400 font-bold">${task.progress}%</span>
+                                    <button onclick="cancelTask('${task.id}')" title="Stop Task" class="text-rose-400 hover:text-rose-300 p-0.5 rounded transition">
+                                        <i class="fa-solid fa-circle-xmark text-sm"></i>
+                                    </button>
+                                </div>
                             </div>
-                        </div>
-                        <div class="w-full bg-slate-800 h-1 rounded-full overflow-hidden my-1">
-                            <div class="bg-sky-500 h-full rounded-full transition-all duration-300" style="width: ${task.progress}%"></div>
-                        </div>
-                        <div class="max-h-20 overflow-y-auto space-y-0.5 mt-1 bg-black/40 p-1.5 rounded">
-                            ${logsHtml}
-                        </div>
-                    `;
-                    taskContainer.appendChild(taskEl);
+                            <div class="w-full bg-slate-800 h-1 rounded-full overflow-hidden my-1">
+                                <div id="task_bar_${task.id}" class="bg-sky-500 h-full rounded-full transition-all duration-300" style="width: ${task.progress}%"></div>
+                            </div>
+                            <div id="task_logs_${task.id}" class="max-h-24 overflow-y-auto space-y-0.5 mt-1 bg-black/40 p-1.5 rounded">
+                                ${logsHtml}
+                            </div>
+                        `;
+                        taskContainer.appendChild(taskEl);
+
+                        const logBox = document.getElementById(`task_logs_${task.id}`);
+                        if (logBox) logBox.scrollTop = logBox.scrollHeight;
+                    } else {
+                        // In-place Update existing elements
+                        const pctEl = document.getElementById(`task_pct_${task.id}`);
+                        const barEl = document.getElementById(`task_bar_${task.id}`);
+                        const logsEl = document.getElementById(`task_logs_${task.id}`);
+
+                        if (pctEl) pctEl.innerText = `${task.progress}%`;
+                        if (barEl) barEl.style.width = `${task.progress}%`;
+
+                        if (logsEl) {
+                            // Smart Scroll Retention: Only auto-scroll to bottom if user is already at/near bottom
+                            const isAtBottom = (logsEl.scrollHeight - logsEl.clientHeight <= logsEl.scrollTop + 30);
+                            logsEl.innerHTML = logsHtml;
+                            if (isAtBottom) {
+                                logsEl.scrollTop = logsEl.scrollHeight;
+                            }
+                        }
+                    }
                 });
 
                 if (activeCount > 0) {
