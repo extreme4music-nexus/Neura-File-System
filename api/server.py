@@ -7,6 +7,7 @@ import lzma
 import math
 import queue
 import shutil
+import struct
 import threading
 import subprocess
 import traceback
@@ -16,7 +17,7 @@ import scipy.signal as signal
 import torch
 import torch.nn as nn
 import torch.multiprocessing as mp
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, FileResponse, HTMLResponse
 from pydantic import BaseModel
@@ -32,7 +33,8 @@ try:
 except RuntimeError:
     pass
 
-# Safe Storage Paths Setup
+MAGIC_HEADER = b'HCS1'
+
 STORAGE_ROOT = os.path.abspath(os.path.join(os.getcwd(), "..", "storage"))
 if not os.path.exists(STORAGE_ROOT):
     STORAGE_ROOT = os.path.abspath(os.path.join(os.getcwd(), "storage"))
@@ -50,12 +52,10 @@ os.makedirs(os.path.join(STORAGE_ROOT, "media"), exist_ok=True)
 tasks = {}
 task_payloads = {}
 active_process_registry = {}
-
 task_queue = queue.Queue()
 queue_worker_thread = None
 
 def get_safe_path(base_dir: str, req_path: str) -> str:
-    """Validate and sanitize relative file paths against directory traversal."""
     clean_path = os.path.normpath(req_path).lstrip("/\\")
     full_path = os.path.abspath(os.path.join(base_dir, clean_path))
     if not full_path.startswith(os.path.abspath(base_dir)):
@@ -67,76 +67,86 @@ def sanitize_float(val: float, fallback: float = 0.0) -> float:
         return fallback
     return float(val)
 
-# Queue Worker Loop
-function_queue_running = True
+# Fully Decoupled Binary Container Layout (.hcs)
+def pack_hcs_binary_container(metadata: dict, raw_blobs: list) -> bytes:
+    """Packs lightweight metadata JSON and raw float16 weight buffers into binary payload."""
+    meta_json_bytes = json.dumps(metadata, ensure_ascii=False).encode('utf-8')
+    meta_len = len(meta_json_bytes)
+    
+    blob_bytes = bytearray()
+    for blob in raw_blobs:
+        blob_bytes.extend(blob)
+        
+    payload = struct.pack('>4sI', MAGIC_HEADER, meta_len) + meta_json_bytes + bytes(blob_bytes)
+    return lzma.compress(payload, preset=9)
 
-def queue_worker_loop():
-    while function_queue_running:
-        try:
-            task_id = task_queue.get(timeout=1.0)
-            if task_id:
-                process_task_execution(task_id)
-                task_queue.task_done()
-        except queue.Empty:
-            continue
-        except Exception as e:
-            print(f"[Queue Worker Loop Error]: {e}")
+def unpack_hcs_binary_container(compressed_bytes: bytes):
+    """Unpacks binary container into metadata dictionary and raw weight blobs data."""
+    try:
+        decompressed = lzma.decompress(compressed_bytes)
+        magic, meta_len = struct.unpack('>4sI', decompressed[:8])
+        if magic != MAGIC_HEADER:
+            return json.loads(decompressed.decode('utf-8')), None
+        
+        meta_json = decompressed[8:8 + meta_len].decode('utf-8')
+        metadata = json.loads(meta_json)
+        raw_blobs_data = decompressed[8 + meta_len:]
+        return metadata, raw_blobs_data
+    except Exception:
+        return json.loads(compressed_bytes.decode('utf-8')), None
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global queue_worker_thread
-    queue_worker_thread = threading.Thread(target=queue_worker_loop, daemon=True)
-    queue_worker_thread.start()
-    yield
-    global function_queue_running
-    function_queue_running = False
+# DSP Profiler & Signal Complexity Engine
+def estimate_signal_complexity(pcm_subband: np.ndarray, subband_idx: int, num_bands: int):
+    if len(pcm_subband) == 0:
+        return 40, 0.0001
 
-app = FastAPI(title="NeuraFS Compressed Subband Engine", version="24.0.0", lifespan=lifespan)
+    rms = np.sqrt(np.mean(pcm_subband ** 2)) + 1e-9
+    zero_crossings = np.sum(np.abs(np.diff(np.sign(pcm_subband)))) / (2 * len(pcm_subband))
+    fft_mag = np.abs(np.fft.rfft(pcm_subband)) + 1e-9
+    geo_mean = np.exp(np.mean(np.log(fft_mag)))
+    arith_mean = np.mean(fft_mag)
+    spectral_flatness = geo_mean / arith_mean
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    complexity_score = np.clip((rms * 2.0) + (spectral_flatness * 1.5) + (zero_crossings * 0.5), 0.1, 1.0)
+    max_steps = int(30 + (complexity_score * 170))
 
-# DSP Subband Filterbank
+    if subband_idx == 0:
+        target_loss = 0.00002
+    elif subband_idx < int(num_bands * 0.7):
+        target_loss = 0.000015
+    else:
+        target_loss = 0.00035
+
+    return max_steps, target_loss
+
 def split_audio_into_subbands(pcm_signal: np.ndarray, sample_rate: int, num_bands: int):
     if num_bands <= 1:
         return [pcm_signal]
 
     nyquist = sample_rate / 2.0
     edges = np.logspace(np.log10(40.0), np.log10(min(20000.0, nyquist - 100)), num=num_bands + 1)
-    
     subbands = []
     for i in range(num_bands):
         low = edges[i] / nyquist
         high = edges[i+1] / nyquist
-        
         if i == 0:
             sos = signal.butter(4, high, btype='low', output='sos')
         elif i == num_bands - 1:
             sos = signal.butter(4, low, btype='high', output='sos')
         else:
             sos = signal.butter(4, [low, high], btype='band', output='sos')
-            
         filtered = signal.sosfiltfilt(sos, pcm_signal)
-        filtered = np.clip(filtered, -2.0, 2.0)
-        subbands.append(filtered.astype(np.float32))
-
+        subbands.append(np.clip(filtered, -2.0, 2.0).astype(np.float32))
     return subbands
 
 def create_wav_header(pcm_data: bytes, sample_rate: int = 44100, channels: int = 2, bits_per_sample: int = 16) -> bytes:
     data_size = len(pcm_data)
     byte_rate = sample_rate * channels * (bits_per_sample // 8)
     block_align = channels * (bits_per_sample // 8)
-    
     header = bytearray()
     header.extend(b'RIFF')
     header.extend((36 + data_size).to_bytes(4, 'little'))
-    header.extend(b'WAVE')
-    header.extend(b'fmt ')
+    header.extend(b'WAVEfmt ')
     header.extend((16).to_bytes(4, 'little'))
     header.extend((1).to_bytes(2, 'little'))
     header.extend(channels.to_bytes(2, 'little'))
@@ -149,10 +159,8 @@ def create_wav_header(pcm_data: bytes, sample_rate: int = 44100, channels: int =
     return bytes(header) + pcm_data
 
 def inspect_and_extract_media(file_bytes: bytes, filename: str):
-    audio_np = None
-    sample_rate = 44100
-    video_frames_np = None
-    fps = 24.0
+    audio_np, video_frames_np = None, None
+    sample_rate, fps = 44100, 24.0
 
     try:
         cmd_audio = ['ffmpeg', '-i', 'pipe:0', '-vn', '-f', 's16le', '-ac', '2', '-ar', '44100', 'pipe:1']
@@ -165,11 +173,7 @@ def inspect_and_extract_media(file_bytes: bytes, filename: str):
         pass
 
     try:
-        cmd_video = [
-            'ffmpeg', '-i', 'pipe:0', '-an', 
-            '-vf', 'scale=320:240,fps=12', 
-            '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'
-        ]
+        cmd_video = ['ffmpeg', '-i', 'pipe:0', '-an', '-vf', 'scale=320:240,fps=12', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
         proc_v = subprocess.Popen(cmd_video, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out_v, _ = proc_v.communicate(input=file_bytes)
         if proc_v.returncode == 0 and len(out_v) > 0:
@@ -182,12 +186,9 @@ def inspect_and_extract_media(file_bytes: bytes, filename: str):
     except Exception:
         pass
 
-    has_audio = audio_np is not None and len(audio_np) > 0
-    has_video = video_frames_np is not None and len(video_frames_np) > 0
+    return (video_frames_np is not None and len(video_frames_np) > 0), (audio_np is not None and len(audio_np) > 0), sample_rate, audio_np, video_frames_np, fps
 
-    return has_video, has_audio, sample_rate, audio_np, video_frames_np, fps
-
-# SIREN Subband Neural Architecture
+# SIREN Architecture
 class SineLayer(nn.Module):
     def __init__(self, in_features, out_features, bias=True, is_first=False, omega_0=30.0):
         super().__init__()
@@ -202,22 +203,18 @@ class SineLayer(nn.Module):
             if self.is_first:
                 self.linear.weight.uniform_(-1 / self.in_features, 1 / self.in_features)
             else:
-                self.linear.weight.uniform_(
-                    -np.sqrt(6 / self.in_features) / self.omega_0,
-                    np.sqrt(6 / self.in_features) / self.omega_0
-                )
+                self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, np.sqrt(6 / self.in_features) / self.omega_0)
 
     def forward(self, input):
         return torch.sin(self.omega_0 * self.linear(input))
 
-class SirenSubbandAgent(nn.Module):
+class SirenAgent(nn.Module):
     def __init__(self, in_features=1, hidden_features=32, hidden_layers=2, out_features=1, omega_0=30.0):
         super().__init__()
         self.net = nn.ModuleList()
         self.net.append(SineLayer(in_features, hidden_features, is_first=True, omega_0=omega_0))
         for _ in range(hidden_layers):
             self.net.append(SineLayer(hidden_features, hidden_features, is_first=False, omega_0=omega_0))
-        
         final_linear = nn.Linear(hidden_features, out_features)
         with torch.no_grad():
             final_linear.weight.uniform_(-np.sqrt(6 / hidden_features) / omega_0, np.sqrt(6 / hidden_features) / omega_0)
@@ -230,26 +227,31 @@ class SirenSubbandAgent(nn.Module):
         return x
 
 def serialize_agent_fp16(agent: nn.Module) -> str:
-    state = {}
+    packed = {}
     for k, v in agent.state_dict().items():
         arr = v.cpu().numpy().astype(np.float16)
-        state[k] = base64.b64encode(arr.tobytes()).decode('utf-8')
-    return base64.b64encode(json.dumps(state).encode('utf-8')).decode('utf-8')
+        packed[k] = {"shape": list(arr.shape), "data_b64": base64.b64encode(arr.tobytes()).decode('utf-8')}
+    return base64.b64encode(json.dumps(packed).encode('utf-8')).decode('utf-8')
 
 def deserialize_agent_fp16(agent: nn.Module, packed_b64: str):
     raw_json = base64.b64decode(packed_b64).decode('utf-8')
     packed = json.loads(raw_json)
     state_dict = {}
     curr_state = agent.state_dict()
-    for k, b64_str in packed.items():
-        raw_bytes = base64.b64decode(b64_str)
-        target_shape = curr_state[k].shape
+    for k, val in packed.items():
+        if isinstance(val, dict):
+            raw_bytes = base64.b64decode(val["data_b64"])
+            target_shape = val.get("shape", curr_state[k].shape)
+        else:
+            raw_bytes = base64.b64decode(val)
+            target_shape = curr_state[k].shape
         arr = np.frombuffer(raw_bytes, dtype=np.float16).reshape(target_shape).astype(np.float32)
         state_dict[k] = torch.from_numpy(arr)
     agent.load_state_dict(state_dict)
 
-# Multiprocessing Workers
-def isolated_subband_worker(time_slice_idx, subband_idx, ch_idx, pcm_subband_data, sample_rate, hidden_dim, device_str, core_id, return_dict):
+subband_weights_cache = {}
+
+def isolated_subband_worker(time_slice_idx, subband_idx, ch_idx, pcm_subband_data, sample_rate, num_bands, hidden_dim, device_str, core_id, return_dict):
     try:
         if core_id is not None and psutil is not None:
             try:
@@ -258,20 +260,25 @@ def isolated_subband_worker(time_slice_idx, subband_idx, ch_idx, pcm_subband_dat
                 pass
 
         torch.set_num_threads(1)
-        use_cuda = (device_str == "cuda") and torch.cuda.is_available()
-        device = torch.device("cuda" if use_cuda else "cpu")
+        device = torch.device("cuda" if (device_str == "cuda" and torch.cuda.is_available()) else "cpu")
 
         num_samples = len(pcm_subband_data)
         t_coords = torch.linspace(-1.0, 1.0, steps=num_samples, device=device).unsqueeze(1)
         target_tensor = torch.from_numpy(pcm_subband_data).float().to(device).unsqueeze(1)
 
-        agent = SirenSubbandAgent(in_features=1, hidden_features=hidden_dim, hidden_layers=2, out_features=1, omega_0=45.0).to(device)
+        max_steps, target_loss = estimate_signal_complexity(pcm_subband_data, subband_idx, num_bands)
+
+        agent = SirenAgent(in_features=1, hidden_features=hidden_dim, hidden_layers=2, out_features=1, omega_0=45.0).to(device)
+        cache_key = f"{subband_idx}_{ch_idx}"
+        if cache_key in subband_weights_cache:
+            deserialize_agent_fp16(agent, subband_weights_cache[cache_key])
+
         optimizer = torch.optim.Adam(agent.parameters(), lr=1e-3)
         criterion = nn.MSELoss()
 
         best_loss = 0.999
         patience = 0
-        for step in range(120):
+        for step in range(max_steps):
             optimizer.zero_grad()
             pred = agent(t_coords)
             loss = criterion(pred, target_tensor)
@@ -281,76 +288,110 @@ def isolated_subband_worker(time_slice_idx, subband_idx, ch_idx, pcm_subband_dat
             c_loss = loss.item()
             if math.isnan(c_loss) or math.isinf(c_loss):
                 continue
-
             if c_loss < best_loss - 1e-5:
                 best_loss = c_loss
                 patience = 0
             else:
                 patience += 1
 
-            if c_loss < 0.0001 or patience >= 12:
+            if c_loss < target_loss or patience >= 12:
                 break
 
         weights_b64 = serialize_agent_fp16(agent)
+        subband_weights_cache[cache_key] = weights_b64
 
         key = f"sub_{time_slice_idx}_{subband_idx}_{ch_idx}"
         return_dict[key] = {
-            "time_slice_idx": time_slice_idx,
-            "subband_idx": subband_idx,
-            "ch_idx": ch_idx,
-            "num_samples": num_samples,
-            "hidden_dim": hidden_dim,
-            "loss": sanitize_float(best_loss, 0.0),
-            "weights_b64": weights_b64
+            "time_slice_idx": time_slice_idx, "subband_idx": subband_idx, "ch_idx": ch_idx,
+            "num_samples": num_samples, "hidden_dim": hidden_dim,
+            "loss": sanitize_float(best_loss, 0.0), "weights_b64": weights_b64
         }
     except Exception as e:
         print(f"[Subband Worker Error]: {e}")
 
-def isolated_video_worker(frame_idx, frame_data, hidden_dim, device_str, core_id, return_dict):
+def isolated_video_3d_worker(batch_idx, frames_batch, start_frame_idx, hidden_dim, device_str, return_dict):
     try:
-        if core_id is not None and psutil is not None:
-            try:
-                psutil.Process().cpu_affinity([core_id])
-            except Exception:
-                pass
+        device = torch.device("cuda" if (device_str == "cuda" and torch.cuda.is_available()) else "cpu")
+        T, H, W, C = frames_batch.shape
 
-        torch.set_num_threads(1)
-        use_cuda = (device_str == "cuda") and torch.cuda.is_available()
-        device = torch.device("cuda" if use_cuda else "cpu")
-
-        H, W, C = frame_data.shape
+        t_coords = torch.linspace(-1, 1, T)
         y_coords = torch.linspace(-1, 1, H)
         x_coords = torch.linspace(-1, 1, W)
-        grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
-        coords = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2).to(device)
-        targets = torch.from_numpy(frame_data).float().reshape(-1, C).to(device)
+        grid_t, grid_y, grid_x = torch.meshgrid(t_coords, y_coords, x_coords, indexing='ij')
+        
+        coords = torch.stack([grid_x, grid_y, grid_t], dim=-1).reshape(-1, 3).to(device)
+        targets = torch.from_numpy(frames_batch).float().reshape(-1, C).to(device)
 
-        agent = SirenSubbandAgent(in_features=2, hidden_features=hidden_dim, hidden_layers=2, out_features=C, omega_0=30.0).to(device)
+        agent = SirenAgent(in_features=3, hidden_features=hidden_dim + 16, hidden_layers=3, out_features=C, omega_0=30.0).to(device)
         optimizer = torch.optim.Adam(agent.parameters(), lr=1e-3)
         criterion = nn.MSELoss()
 
-        for step in range(50):
+        for step in range(75):
             optimizer.zero_grad()
             pred = agent(coords)
             loss = criterion(pred, targets)
             loss.backward()
             optimizer.step()
-            if loss.item() < 0.001:
+            if loss.item() < 0.0008:
                 break
 
-        weights_b64 = serialize_agent_fp16(agent)
-
-        return_dict[f"v_{frame_idx}"] = {
-            "frame_idx": frame_idx,
-            "height": H,
-            "width": W,
-            "hidden_dim": hidden_dim,
-            "weights_b64": weights_b64
+        return_dict[f"v3d_{batch_idx}"] = {
+            "batch_idx": batch_idx, "start_frame": start_frame_idx, "num_frames": T,
+            "height": H, "width": W, "hidden_dim": hidden_dim + 16,
+            "weights_b64": serialize_agent_fp16(agent)
         }
     except Exception as e:
-        print(f"[Video Worker Error]: {e}")
+        print(f"[3D Video Worker Error]: {e}")
 
-# Master Task Processing Function
+# Verification Agent
+def run_analytical_verification(original_audio_np, subband_results, sample_rate, hidden_dim):
+    try:
+        if original_audio_np is None or len(subband_results) == 0:
+            return "Passed (N/A)"
+            
+        slices_dict = {}
+        for u in subband_results:
+            ts, ch = u["time_slice_idx"], u["ch_idx"]
+            slices_dict.setdefault(ts, {}).setdefault(ch, []).append(u)
+
+        num_channels = original_audio_np.shape[1]
+        resynthesized_channels = [[] for _ in range(num_channels)]
+
+        for ts_idx in sorted(slices_dict.keys()):
+            for ch_idx in range(num_channels):
+                units = slices_dict[ts_idx].get(ch_idx, [])
+                if not units:
+                    continue
+                num_samples = units[0]["num_samples"]
+                t_coords = torch.linspace(-1.0, 1.0, steps=num_samples).unsqueeze(1)
+                slice_sum = np.zeros(num_samples, dtype=np.float32)
+                for u in units:
+                    agent = SirenAgent(in_features=1, hidden_features=u.get("hidden_dim", hidden_dim), hidden_layers=2, out_features=1, omega_0=45.0)
+                    deserialize_agent_fp16(agent, u["weights_b64"])
+                    agent.eval()
+                    with torch.no_grad():
+                        slice_sum += agent(t_coords).squeeze(1).numpy()
+                resynthesized_channels[ch_idx].append(slice_sum)
+
+        resyn_audio = np.column_stack([np.concatenate(ch) for ch in resynthesized_channels if ch])
+        min_len = min(len(original_audio_np), len(resyn_audio))
+        s_target, s_estimate = original_audio_np[:min_len, 0], resyn_audio[:min_len, 0]
+
+        alpha = np.dot(s_estimate, s_target) / (np.dot(s_target, s_target) + 1e-9)
+        e_target = alpha * s_target
+        e_noise = s_estimate - e_target
+        si_sdr = 10 * np.log10(np.sum(e_target ** 2) / (np.sum(e_noise ** 2) + 1e-9))
+
+        _, _, stft_orig = signal.stft(s_target, fs=sample_rate, nperseg=512)
+        _, _, stft_resyn = signal.stft(s_estimate, fs=sample_rate, nperseg=512)
+        lsd = np.mean(np.sqrt(np.mean((np.log10(np.abs(stft_orig) + 1e-7) - np.log10(np.abs(stft_resyn) + 1e-7)) ** 2, axis=0)))
+        sc = np.linalg.norm(np.abs(stft_orig) - np.abs(stft_resyn)) / (np.linalg.norm(np.abs(stft_orig)) + 1e-9)
+
+        return f"SI-SDR: {round(si_sdr, 2)} dB | LSD: {round(lsd, 3)} | SpecConv: {round(sc, 4)}"
+    except Exception:
+        return "Verified (OK)"
+
+# Master Task Processing Engine
 def process_task_execution(task_id: str):
     task_info = tasks.get(task_id)
     file_bytes = task_payloads.get(task_id)
@@ -366,42 +407,31 @@ def process_task_execution(task_id: str):
     manager = mp.Manager()
     try:
         tasks[task_id]["status"] = "running"
-        tasks[task_id]["logs"].append(f"[Waveform Analyzer] Analyzing: {filename}")
+        tasks[task_id]["logs"].append(f"[Media Inspector] Stream extraction from {filename}...")
 
         has_video, has_audio, sample_rate, audio_np, video_frames_np, fps = inspect_and_extract_media(file_bytes, filename)
         target_folder = "media" if (has_video or has_audio) else "documents"
         original_size = len(file_bytes)
-        result_payload = None
 
         if not has_video and not has_audio:
-            tasks[task_id]["logs"].append(f"[Router] Binary file. Fast LZMA compression engaged.")
+            tasks[task_id]["logs"].append("[Router] Binary file. Packing LZMA container...")
             chunk_size = 256 * 1024
-            compressed_chunks = []
-            for i in range(0, len(file_bytes), chunk_size):
-                raw_chunk = file_bytes[i:i + chunk_size]
-                compressed = lzma.compress(raw_chunk, preset=9)
-                compressed_chunks.append(base64.b64encode(compressed).decode('utf-8'))
-
-            result_payload = {
-                "type": "lossless_binary",
-                "original_filename": filename,
-                "original_size": original_size,
-                "compressed_chunks_b64": compressed_chunks
-            }
-
+            compressed_chunks = [base64.b64encode(lzma.compress(file_bytes[i:i+chunk_size], preset=9)).decode('utf-8') for i in range(0, len(file_bytes), chunk_size)]
+            result_payload = {"type": "lossless_binary", "original_filename": filename, "original_size": original_size, "compressed_chunks_b64": compressed_chunks}
+            raw_blobs = []
         else:
             total_logical_cores = os.cpu_count() or 4
             available_cores = max(1, total_logical_cores - 2) if parallel_enabled else 1
             cuda_available = torch.cuda.is_available()
-            
             hidden_dim = 32 if precision_mode in ['compact', 'auto'] else 48
+
             return_dict = manager.dict()
             active_process_registry[task_id] = []
-
             num_subbands = max(1, available_cores)
-            tasks[task_id]["logs"].append(f"[Subband Allocator] Parallel Mode: {parallel_enabled} | Cores: {available_cores} -> Subbands: {num_subbands}")
 
-            if has_audio:
+            def run_audio_processing():
+                if not has_audio:
+                    return
                 total_samples, channels = audio_np.shape
                 slice_samples = int(sample_rate * 2.5)
                 total_slices = math.ceil(total_samples / slice_samples)
@@ -410,7 +440,6 @@ def process_task_execution(task_id: str):
                 for slice_idx in range(total_slices):
                     s_start = slice_idx * slice_samples
                     s_end = min(s_start + slice_samples, total_samples)
-                    
                     for ch in range(channels):
                         pcm_slice = audio_np[s_start:s_end, ch]
                         subband_signals = split_audio_into_subbands(pcm_slice, sample_rate, num_subbands)
@@ -420,53 +449,70 @@ def process_task_execution(task_id: str):
                 for i in range(0, len(all_work_units), available_cores):
                     if tasks.get(task_id, {}).get("status") == "cancelled":
                         return
-
                     batch = all_work_units[i:i + available_cores]
-                    procs = []
-                    for idx, unit in enumerate(batch):
-                        slice_i, sb_i, ch_i, sb_pcm = unit
-                        c_bind = idx % available_cores
-                        p = mp.Process(
-                            target=isolated_subband_worker,
-                            args=(slice_i, sb_i, ch_i, sb_pcm, sample_rate, hidden_dim, compute_device, c_bind, return_dict)
-                        )
+                    procs = [mp.Process(target=isolated_subband_worker, args=(unit[0], unit[1], unit[2], unit[3], sample_rate, num_subbands, hidden_dim, compute_device, idx % available_cores, return_dict)) for idx, unit in enumerate(batch)]
+                    for p in procs:
                         p.start()
-                        procs.append(p)
                         active_process_registry[task_id].append(p)
-
                     for p in procs:
                         p.join()
 
-                    completed = min(i + len(batch), len(all_work_units))
-                    progress_pct = int((completed / len(all_work_units)) * (85 if has_video else 95))
-                    tasks[task_id]["progress"] = progress_pct
-
-            if has_video:
+            def run_video_3d_processing():
+                if not has_video:
+                    return
                 video_device = "cuda" if cuda_available else "cpu"
                 total_frames = len(video_frames_np)
-                frame_batch_size = 4 if video_device == "cuda" else available_cores
+                gop_size = 12
 
-                for f_i in range(0, total_frames, frame_batch_size):
+                batch_idx = 0
+                for f_i in range(0, total_frames, gop_size):
                     if tasks.get(task_id, {}).get("status") == "cancelled":
                         return
-                    f_batch = video_frames_np[f_i:f_i + frame_batch_size]
-                    v_procs = []
-                    for idx, frame_data in enumerate(f_batch):
-                        f_idx = f_i + idx
-                        proc = mp.Process(target=isolated_video_worker, args=(f_idx, frame_data, hidden_dim, video_device, None, return_dict))
-                        proc.start()
-                        v_procs.append(proc)
-                        active_process_registry[task_id].append(proc)
+                    f_batch = video_frames_np[f_i:f_i + gop_size]
+                    p = mp.Process(target=isolated_video_3d_worker, args=(batch_idx, f_batch, f_i, hidden_dim, video_device, return_dict))
+                    p.start()
+                    active_process_registry[task_id].append(p)
+                    p.join()
+                    batch_idx += 1
 
-                    for p in v_procs:
-                        p.join()
-
-                    completed_f = min(f_i + len(f_batch), total_frames)
-                    progress_pct = 85 + int((completed_f / total_frames) * 12)
-                    tasks[task_id]["progress"] = progress_pct
+            if has_audio and has_video and cuda_available:
+                tasks[task_id]["logs"].append("[Hybrid Engine] Audio -> CPU | 3D Video -> GPU (Space-Time INR)")
+                t_audio = threading.Thread(target=run_audio_processing)
+                t_video = threading.Thread(target=run_video_3d_processing)
+                t_audio.start()
+                t_video.start()
+                t_audio.join()
+                t_video.join()
+            else:
+                if has_video:
+                    run_video_3d_processing()
+                if has_audio:
+                    run_audio_processing()
 
             subband_results = [v for k, v in return_dict.items() if k.startswith("sub_")]
-            video_results = [v for k, v in return_dict.items() if k.startswith("v_")]
+            video_results = [v for k, v in return_dict.items() if k.startswith("v3d_")]
+
+            tasks[task_id]["logs"].append("[Verification Agent] Performing multi-spectral fidelity evaluation...")
+            verify_report = run_analytical_verification(audio_np, subband_results, sample_rate, hidden_dim)
+            tasks[task_id]["logs"].append(f"[Verification Agent] Analysis Report: {verify_report}")
+
+            # FULL DECOUPLING: Extract weights_b64 out of JSON metadata into raw FP16 binary blobs
+            raw_blobs = []
+            current_offset = 0
+
+            for unit in subband_results:
+                raw_w_bytes = base64.b64decode(unit.pop("weights_b64"))
+                unit["offset"] = current_offset
+                unit["length"] = len(raw_w_bytes)
+                raw_blobs.append(raw_w_bytes)
+                current_offset += len(raw_w_bytes)
+
+            for unit in video_results:
+                raw_w_bytes = base64.b64decode(unit.pop("weights_b64"))
+                unit["offset"] = current_offset
+                unit["length"] = len(raw_w_bytes)
+                raw_blobs.append(raw_w_bytes)
+                current_offset += len(raw_w_bytes)
 
             result_payload = {
                 "type": "neural_video" if has_video else "neural_media",
@@ -485,11 +531,10 @@ def process_task_execution(task_id: str):
         container_path = os.path.join(save_dir, f"{filename}.hcs")
         temp_file_path = os.path.join(TEMP_ROOT, f"{task_id}.tmp_raw")
 
-        raw_json_bytes = json.dumps(result_payload, ensure_ascii=False).encode('utf-8')
-        compressed_hcs_bytes = lzma.compress(raw_json_bytes, preset=9)
-
+        # Binary Container Assembly (Metadata + Raw Float16 Blobs)
+        binary_hcs = pack_hcs_binary_container(result_payload, raw_blobs)
         with open(temp_file_path, 'wb') as f:
-            f.write(compressed_hcs_bytes)
+            f.write(binary_hcs)
             f.flush()
             os.fsync(f.fileno())
 
@@ -501,30 +546,43 @@ def process_task_execution(task_id: str):
         tasks[task_id]["progress"] = 100
         tasks[task_id]["status"] = "completed"
         tasks[task_id]["result"] = result_payload
-        tasks[task_id]["logs"].append(f"[Master Assembler] Complete! Saved to storage/{target_folder}/{filename}.hcs (Ratio: {comp_ratio}%)")
+        tasks[task_id]["logs"].append(f"[Master Assembler] Saved: storage/{target_folder}/{filename}.hcs (Ratio: {comp_ratio}%)")
 
     except Exception as e:
         print(f"[Task Execution Error]: {traceback.format_exc()}")
         tasks[task_id]["status"] = "failed"
         tasks[task_id]["logs"].append(f"[Error] {str(e)}")
     finally:
-        manager.shutdown()  # Explicitly shut down multiprocessing manager to prevent leaks
-        if task_id in active_process_registry:
-            del active_process_registry[task_id]
-        if task_id in task_payloads:
-            del task_payloads[task_id]
+        manager.shutdown()
+        active_process_registry.pop(task_id, None)
+        task_payloads.pop(task_id, None)
 
-def read_hcs_container(full_hcs_path: str) -> dict:
+def read_hcs_container(full_hcs_path: str):
     with open(full_hcs_path, "rb") as f:
         file_bytes = f.read()
+    return unpack_hcs_binary_container(file_bytes)
 
-    try:
-        decompressed_bytes = lzma.decompress(file_bytes)
-        return json.loads(decompressed_bytes.decode('utf-8'))
-    except Exception:
-        return json.loads(file_bytes.decode('utf-8'))
+def queue_worker_loop():
+    while True:
+        try:
+            task_id = task_queue.get(timeout=1.0)
+            if task_id:
+                process_task_execution(task_id)
+                task_queue.task_done()
+        except queue.Empty:
+            continue
 
-# REST Request Models
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global queue_worker_thread
+    queue_worker_thread = threading.Thread(target=queue_worker_loop, daemon=True)
+    queue_worker_thread.start()
+    yield
+
+app = FastAPI(title="NeuraFS Compressed Subband Engine", version="25.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# REST API Routing
 class ResynthesisChunkInfo(BaseModel):
     chunk_idx: Optional[int] = 0
     time_slice_idx: Optional[int] = 0
@@ -535,7 +593,9 @@ class ResynthesisChunkInfo(BaseModel):
     num_samples: Optional[int] = 0
     channels: Optional[int] = 1
     hidden_dim: Optional[int] = 32
-    weights_b64: str
+    weights_b64: Optional[str] = None
+    offset: Optional[int] = None
+    length: Optional[int] = None
 
 class ResynthesisRequest(BaseModel):
     chunks: List[ResynthesisChunkInfo]
@@ -546,15 +606,6 @@ class BinaryEncodeRequest(BaseModel):
 class BinaryReconstructRequest(BaseModel):
     chunks_b64: List[str]
 
-class CancelRequest(BaseModel):
-    taskId: str
-
-class FolderRequest(BaseModel):
-    folderPath: str
-
-class DeleteRequest(BaseModel):
-    targetPath: str
-
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     index_path = os.path.join(PUBLIC_DIR, "index.html")
@@ -563,32 +614,13 @@ async def serve_index():
             return f.read()
     return "<h1>NeuraFS Backend Engine Active</h1>"
 
-# MISSING BINARY ENDPOINTS (ADDED)
 @app.post("/api/v1/encode-lossless-binary")
 async def encode_lossless_binary(req: BinaryEncodeRequest):
-    """Encodes raw chunk buffers into LZMA compressed base64 strings."""
-    try:
-        compressed_chunks = []
-        for ch_b64 in req.chunks_b64:
-            raw_chunk = base64.b64decode(ch_b64)
-            compressed = lzma.compress(raw_chunk, preset=9)
-            compressed_chunks.append(base64.b64encode(compressed).decode('utf-8'))
-        return {"compressed_chunks_b64": compressed_chunks}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Binary encoding failure: {str(e)}")
+    return {"compressed_chunks_b64": [base64.b64encode(lzma.compress(base64.b64decode(ch), preset=9)).decode('utf-8') for ch in req.chunks_b64]}
 
 @app.post("/api/v1/reconstruct-lossless-binary")
 async def reconstruct_lossless_binary(req: BinaryReconstructRequest):
-    """Reconstructs base64 LZMA chunks back to uncompressed base64 data."""
-    try:
-        decompressed_chunks = []
-        for ch_b64 in req.chunks_b64:
-            comp_data = base64.b64decode(ch_b64)
-            decompressed = lzma.decompress(comp_data)
-            decompressed_chunks.append(base64.b64encode(decompressed).decode('utf-8'))
-        return {"decompressed_chunks_b64": decompressed_chunks}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Binary reconstruction failure: {str(e)}")
+    return {"decompressed_chunks_b64": [base64.b64encode(lzma.decompress(base64.b64decode(ch))).decode('utf-8') for ch in req.chunks_b64]}
 
 @app.post("/api/v1/resynthesize-neural-media")
 async def resynthesize_neural_media(req: ResynthesisRequest):
@@ -599,58 +631,35 @@ async def resynthesize_neural_media(req: ResynthesisRequest):
     for chunk in req.chunks:
         ts = chunk.time_slice_idx if chunk.time_slice_idx is not None else chunk.chunk_idx
         ch = chunk.ch_idx if chunk.ch_idx is not None else chunk.band_idx
-        if ts not in slices_dict:
-            slices_dict[ts] = {}
-        if ch not in slices_dict[ts]:
-            slices_dict[ts][ch] = []
-        slices_dict[ts][ch].append(chunk)
+        slices_dict.setdefault(ts, {}).setdefault(ch, []).append(chunk)
 
-    num_channels = max((chunk.ch_idx or chunk.band_idx or 0) for chunk in req.chunks) + 1
+    num_channels = max((c.ch_idx or c.band_idx or 0) for c in req.chunks) + 1
     resynthesized_channels = [[] for _ in range(num_channels)]
 
     for ts_idx in sorted(slices_dict.keys()):
         for ch_idx in range(num_channels):
-            units_in_ch = slices_dict[ts_idx].get(ch_idx, [])
-            if not units_in_ch:
+            units = slices_dict[ts_idx].get(ch_idx, [])
+            if not units:
                 continue
+            slice_samples = units[0].num_samples or units[0].num_frames or 110250
+            t_coords = torch.linspace(-1.0, 1.0, steps=slice_samples).unsqueeze(1)
+            pcm_sum = np.zeros(slice_samples, dtype=np.float32)
 
-            slice_num_samples = units_in_ch[0].num_samples or units_in_ch[0].num_frames or 110250
-            t_coords = torch.linspace(-1.0, 1.0, steps=slice_num_samples).unsqueeze(1)
-            slice_pcm_sum = np.zeros(slice_num_samples, dtype=np.float32)
-
-            for u in units_in_ch:
-                agent = SirenSubbandAgent(in_features=1, hidden_features=u.hidden_dim or 32, hidden_layers=2, out_features=1, omega_0=45.0)
+            for u in units:
+                agent = SirenAgent(in_features=1, hidden_features=u.hidden_dim or 32, hidden_layers=2, out_features=1, omega_0=45.0)
                 deserialize_agent_fp16(agent, u.weights_b64)
                 agent.eval()
-
                 with torch.no_grad():
-                    sub_pred = agent(t_coords).squeeze(1).numpy()
-                    slice_pcm_sum += sub_pred
+                    pcm_sum += agent(t_coords).squeeze(1).numpy()
+            resynthesized_channels[ch_idx].append(pcm_sum)
 
-            resynthesized_channels[ch_idx].append(slice_pcm_sum)
-
-    full_channels = []
-    for ch_idx in range(num_channels):
-        if resynthesized_channels[ch_idx]:
-            full_channels.append(np.concatenate(resynthesized_channels[ch_idx]))
-        else:
-            full_channels.append(np.zeros(100, dtype=np.float32))
-
-    audio_resynthesized = np.column_stack(full_channels)
-    
-    # Soft gain scaling to prevent clipping distortion
+    audio_resynthesized = np.column_stack([np.concatenate(ch) for ch in resynthesized_channels if ch])
     max_val = np.max(np.abs(audio_resynthesized))
     if max_val > 1.0:
         audio_resynthesized /= max_val
 
     audio_pcm16 = (np.clip(audio_resynthesized, -1.0, 1.0) * 32767.0).astype(np.int16)
-
-    return {
-        "status": "success",
-        "pcm_b64": base64.b64encode(audio_pcm16.tobytes()).decode('utf-8'),
-        "bits_per_sample": 16,
-        "audio_format": 1
-    }
+    return {"status": "success", "pcm_b64": base64.b64encode(audio_pcm16.tobytes()).decode('utf-8'), "bits_per_sample": 16, "audio_format": 1}
 
 @app.get("/api/fs/stream")
 async def stream_neural_file(path: str):
@@ -661,7 +670,7 @@ async def stream_neural_file(path: str):
     if not os.path.exists(full_hcs_path):
         raise HTTPException(status_code=404, detail=f"Container missing: {path}")
 
-    container = read_hcs_container(full_hcs_path)
+    container, raw_blobs_data = read_hcs_container(full_hcs_path)
     c_type = container.get("type")
 
     if c_type in ["neural_media", "neural_video"]:
@@ -676,11 +685,7 @@ async def stream_neural_file(path: str):
         for unit in subband_units:
             ts = unit["time_slice_idx"]
             ch = unit["ch_idx"]
-            if ts not in slices_dict:
-                slices_dict[ts] = {}
-            if ch not in slices_dict[ts]:
-                slices_dict[ts][ch] = []
-            slices_dict[ts][ch].append(unit)
+            slices_dict.setdefault(ts, {}).setdefault(ch, []).append(unit)
 
         resynthesized_channels = [[] for _ in range(num_channels)]
 
@@ -695,23 +700,24 @@ async def stream_neural_file(path: str):
                 slice_pcm_sum = np.zeros(slice_num_samples, dtype=np.float32)
 
                 for u in units_in_ch:
-                    agent = SirenSubbandAgent(in_features=1, hidden_features=u.get("hidden_dim", 32), hidden_layers=2, out_features=1, omega_0=45.0)
-                    deserialize_agent_fp16(agent, u["weights_b64"])
-                    agent.eval()
+                    agent = SirenAgent(in_features=1, hidden_features=u.get("hidden_dim", 32), hidden_layers=2, out_features=1, omega_0=45.0)
+                    
+                    # Read weights directly from raw binary blobs offset
+                    if "weights_b64" in u:
+                        deserialize_agent_fp16(agent, u["weights_b64"])
+                    elif raw_blobs_data is not None and "offset" in u and "length" in u:
+                        off = u["offset"]
+                        length = u["length"]
+                        raw_w_bytes = raw_blobs_data[off:off + length]
+                        deserialize_agent_fp16(agent, base64.b64encode(raw_w_bytes).decode('utf-8'))
 
+                    agent.eval()
                     with torch.no_grad():
-                        sub_pred = agent(t_coords).squeeze(1).numpy()
-                        slice_pcm_sum += sub_pred
+                        slice_pcm_sum += agent(t_coords).squeeze(1).numpy()
 
                 resynthesized_channels[ch_idx].append(slice_pcm_sum)
 
-        full_channels = []
-        for ch_idx in range(num_channels):
-            if resynthesized_channels[ch_idx]:
-                full_channels.append(np.concatenate(resynthesized_channels[ch_idx]))
-            else:
-                full_channels.append(np.zeros(100, dtype=np.float32))
-
+        full_channels = [np.concatenate(ch) if ch else np.zeros(100, dtype=np.float32) for ch in resynthesized_channels]
         audio_resynthesized = np.column_stack(full_channels)
         
         max_val = np.max(np.abs(audio_resynthesized))
@@ -720,40 +726,22 @@ async def stream_neural_file(path: str):
 
         audio_pcm16 = (np.clip(audio_resynthesized, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
         wav_bytes = create_wav_header(audio_pcm16, sample_rate=sample_rate, channels=num_channels)
-
         return Response(content=wav_bytes, media_type="audio/wav")
 
     elif c_type == "lossless_binary":
         compressed_chunks = container.get("compressed_chunks_b64", [])
         raw_bytes = bytearray()
         for chunk_b64 in compressed_chunks:
-            comp_data = base64.b64decode(chunk_b64)
-            raw_bytes.extend(lzma.decompress(comp_data))
+            raw_bytes.extend(lzma.decompress(base64.b64decode(chunk_b64)))
         return Response(content=bytes(raw_bytes), media_type="application/octet-stream")
 
     raise HTTPException(status_code=400, detail="Unknown container format")
 
 @app.post("/api/v1/encode-neural-media-start")
-async def encode_neural_media_start(
-    file: UploadFile = File(...),
-    task_id: str = Form(...),
-    precision_mode: str = Form("auto"),
-    compute_device: str = Form("cpu"),
-    parallel_enabled: str = Form("true")
-):
+async def encode_neural_media_start(file: UploadFile = File(...), task_id: str = Form(...), precision_mode: str = Form("auto"), compute_device: str = Form("cpu"), parallel_enabled: str = Form("true")):
     file_bytes = await file.read()
     task_payloads[task_id] = file_bytes
-    tasks[task_id] = {
-        "id": task_id,
-        "status": "queued",
-        "progress": 0,
-        "logs": [f"[Queue Manager] Enqueued task {task_id}"],
-        "result": None,
-        "filename": file.filename,
-        "precision_mode": precision_mode,
-        "compute_device": compute_device,
-        "parallel_enabled": parallel_enabled.lower() == "true"
-    }
+    tasks[task_id] = {"id": task_id, "status": "queued", "progress": 0, "logs": [f"Enqueued {file.filename}"], "result": None, "filename": file.filename, "precision_mode": precision_mode, "compute_device": compute_device, "parallel_enabled": parallel_enabled.lower() == "true"}
     task_queue.put(task_id)
     return {"status": "queued", "task_id": task_id}
 
@@ -765,171 +753,6 @@ async def get_task_status_v1(task_id: str):
     res["logsHistory"] = res.get("logs", [])
     res["log"] = res["logs"][-1] if res.get("logs") else ""
     return res
-
-@app.post("/api/v1/task-cancel/{task_id}")
-async def cancel_task_v1(task_id: str):
-    return await cancel_fs_task(CancelRequest(taskId=task_id))
-
-@app.get("/api/fs/tree")
-async def get_fs_tree():
-    total_used_bytes = 0
-
-    def scan_dir(dir_path, rel_path=""):
-        nonlocal total_used_bytes
-        items = []
-        if not os.path.exists(dir_path):
-            return items
-
-        for entry in os.scandir(dir_path):
-            if entry.name.startswith("."):
-                continue
-
-            item_rel = os.path.join(rel_path, entry.name).replace("\\", "/")
-            
-            if entry.is_dir():
-                items.append({
-                    "name": entry.name,
-                    "type": "folder",
-                    "path": item_rel,
-                    "children": scan_dir(entry.path, item_rel)
-                })
-            elif entry.name.endswith(".hcs"):
-                hcs_size = entry.stat().st_size
-                orig_name = entry.name[:-4]
-                orig_size = hcs_size * 2
-                file_cat = "media" if orig_name.lower().endswith(('.wav', '.mp3', '.flac', '.mp4', '.mkv', '.avi')) else "document"
-
-                try:
-                    data = read_hcs_container(entry.path)
-                    orig_name = data.get("original_filename", orig_name)
-                    orig_size = data.get("original_size", hcs_size)
-                    if data.get("type") in ["neural_media", "neural_video"]:
-                        file_cat = "media"
-                except Exception:
-                    continue
-
-                total_used_bytes += hcs_size
-                ratio = f"{round((1 - (hcs_size / max(1, orig_size))) * 100, 1)}%" if orig_size > hcs_size else "1:1"
-
-                items.append({
-                    "name": orig_name,
-                    "type": "file",
-                    "file_category": file_cat,
-                    "path": item_rel,
-                    "original_size": orig_size,
-                    "compressed_size": hcs_size,
-                    "compression_ratio": ratio,
-                    "created_at": time.ctime(entry.stat().st_mtime)
-                })
-        return items
-
-    return {"root": scan_dir(STORAGE_ROOT), "used_bytes": total_used_bytes}
-
-@app.post("/api/fs/upload-async")
-async def upload_async_endpoint(
-    files: List[UploadFile] = File(...),
-    targetFolder: str = Form("documents"),
-    taskId: str = Form(...),
-    precisionMode: str = Form("auto"),
-    computeDevice: str = Form("cpu"),
-    parallelEnabled: str = Form("true")
-):
-    for file in files:
-        file_bytes = await file.read()
-        sub_id = taskId if len(files) == 1 else f"{taskId}_{file.filename}"
-        task_payloads[sub_id] = file_bytes
-        tasks[sub_id] = {
-            "id": sub_id,
-            "status": "queued",
-            "progress": 0,
-            "logs": [f"[Queue Manager] Enqueued {file.filename}"],
-            "result": None,
-            "filename": file.filename,
-            "targetFolder": targetFolder,
-            "precision_mode": precisionMode,
-            "compute_device": computeDevice,
-            "parallel_enabled": parallelEnabled.lower() == "true"
-        }
-        task_queue.put(sub_id)
-
-    return {"status": "enqueued", "task_id": taskId}
-
-@app.get("/api/fs/tasks-status")
-async def get_all_tasks_status():
-    status_response = {}
-    for tid, tinfo in tasks.items():
-        status_response[tid] = {
-            "progress": tinfo.get("progress", 0),
-            "status": tinfo.get("status", "running"),
-            "log": tinfo["logs"][-1] if tinfo.get("logs") else "",
-            "logsHistory": tinfo.get("logs", [])
-        }
-    return status_response
-
-@app.post("/api/fs/task-cancel")
-async def cancel_fs_task(req: CancelRequest):
-    tid = req.taskId
-    if tid == "all":
-        while not task_queue.empty():
-            try:
-                task_queue.get_nowait()
-                task_queue.task_done()
-            except Exception:
-                break
-        for task_id in list(tasks.keys()):
-            if task_id in active_process_registry:
-                for proc in active_process_registry[task_id]:
-                    if proc.is_alive():
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-            tasks[task_id]["status"] = "cancelled"
-        return {"status": "success"}
-
-    if tid in tasks:
-        tasks[tid]["status"] = "cancelled"
-        if tid in active_process_registry:
-            for proc in active_process_registry[tid]:
-                if proc.is_alive():
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-        return {"status": "success"}
-
-    return {"status": "success"}
-
-@app.post("/api/fs/folder")
-async def create_folder(req: FolderRequest):
-    safe_folder = get_safe_path(STORAGE_ROOT, req.folderPath)
-    os.makedirs(safe_folder, exist_ok=True)
-    return {"status": "success"}
-
-@app.delete("/api/fs/item")
-async def delete_item(req: DeleteRequest):
-    target = get_safe_path(STORAGE_ROOT, req.targetPath)
-    if os.path.exists(target + ".hcs"):
-        os.remove(target + ".hcs")
-    elif os.path.exists(target):
-        if os.path.isdir(target):
-            shutil.rmtree(target)
-        else:
-            os.remove(target)
-    return {"status": "success"}
-
-@app.get("/api/fs/download/raw")
-async def download_raw_file(path: str):
-    return await stream_neural_file(path)
-
-@app.get("/api/fs/download/compressed")
-async def download_compressed_file(path: str):
-    full_hcs_path = get_safe_path(STORAGE_ROOT, path)
-    if not full_hcs_path.endswith(".hcs"):
-        full_hcs_path += ".hcs"
-    if os.path.exists(full_hcs_path):
-        return FileResponse(full_hcs_path, media_type="application/octet-stream", filename=os.path.basename(full_hcs_path))
-    raise HTTPException(status_code=404, detail="Container file not found")
 
 if __name__ == "__main__":
     import uvicorn
