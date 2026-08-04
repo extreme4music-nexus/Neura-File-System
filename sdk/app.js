@@ -14,7 +14,7 @@ const sdk = new HyperCompressorSDK(PYTHON_API_URL);
 const STORAGE_ROOT = path.join(__dirname, '..', 'storage');
 const TEMP_ROOT = path.join(STORAGE_ROOT, '.temp');
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const TEMP_DIR = path.join(__dirname, 'temp');
+const TEMP_DIR = TEMP_ROOT;
 
 const activeTasks = {};
 
@@ -30,8 +30,7 @@ function initializeDirectories() {
         TEMP_ROOT,
         path.join(STORAGE_ROOT, 'media'),
         path.join(STORAGE_ROOT, 'documents'),
-        PUBLIC_DIR,
-        TEMP_DIR
+        PUBLIC_DIR
     ].forEach(dir => {
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     });
