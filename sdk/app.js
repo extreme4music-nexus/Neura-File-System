@@ -13,7 +13,7 @@ const sdk = new HyperCompressorSDK(PYTHON_API_URL);
 // Synced storage paths matching server.py architecture
 const STORAGE_ROOT = path.join(__dirname, '..', 'storage');
 const TEMP_ROOT = path.join(STORAGE_ROOT, '.temp');
-const PUBLIC_DIR = path.join(__dirname, 'public');
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const TEMP_DIR = TEMP_ROOT;
 
 const activeTasks = {};
@@ -42,7 +42,6 @@ function calculateFolderSize(dirPath) {
     const items = fs.readdirSync(dirPath, { withFileTypes: true });
 
     for (const item of items) {
-        // Skip hidden directories/files (like .temp)
         if (item.name.startsWith('.')) continue;
 
         const abs = path.join(dirPath, item.name);
@@ -58,7 +57,6 @@ function buildDirectoryTree(dirPath, relativePath = '') {
     const tree = [];
 
     for (const item of items) {
-        // 🚫 Completely skip hidden folders like .temp and hidden system files
         if (item.name.startsWith('.')) continue;
 
         const itemRelPath = path.join(relativePath, item.name).replace(/\\/g, '/');
@@ -118,7 +116,6 @@ function buildDirectoryTree(dirPath, relativePath = '') {
                     });
                 }
             } catch (err) {
-                // Gracefully ignore incomplete or invalid JSON containers without printing warnings
                 continue;
             }
         }
@@ -210,7 +207,7 @@ app.post('/api/fs/upload-async', upload.any(), async (req, res) => {
     const parallelEnabled = req.body.parallelEnabled !== 'false';
 
     const relativePaths = [].concat(req.body.relativePaths || req.body.relativePath || []);
-    const targetFolder = req.body.targetFolder || 'documents';
+    const userTargetFolder = req.body.targetFolder || 'documents';
     const isFolderBundle = files.length > 1 || relativePaths.length > 0;
 
     res.json({ status: 'processing', taskId, message: 'Neural parameterization initiated' });
@@ -219,15 +216,12 @@ app.post('/api/fs/upload-async', upload.any(), async (req, res) => {
         id: taskId,
         fileName: isFolderBundle ? 'Folder Bundle' : files[0].originalname,
         progress: 5,
-        log: `Initiating Neural Parameterization [Device: ${computeDevice.toUpperCase()} | Parallel: ${parallelEnabled}]...`,
+        log: `Initiating Neural Parameterization...`,
         logsHistory: [`[NeuraFS Node.js] Mode: ${precisionMode.toUpperCase()} | Device: ${computeDevice.toUpperCase()}`],
         status: 'running'
     };
 
     try {
-        const destDir = path.join(STORAGE_ROOT, targetFolder);
-        if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
-
         const onProgress = (progressPercent, statusLog, pythonLogs) => {
             if (activeTasks[taskId] && activeTasks[taskId].status === 'cancelled') {
                 throw new Error('Task cancelled by user.');
@@ -250,11 +244,17 @@ app.post('/api/fs/upload-async', upload.any(), async (req, res) => {
                 relativePath: relativePaths[i] || f.originalname
             }));
 
+            const destDir = path.join(STORAGE_ROOT, userTargetFolder);
             await sdk.compressFolderBundle(fileItems, destDir, folderName, taskId, onProgress, precisionMode, computeDevice, parallelEnabled);
             fileItems.forEach(f => { if (fs.existsSync(f.tempFilePath)) fs.unlinkSync(f.tempFilePath); });
 
         } else {
             const file = files[0];
+            const isMedia = /\.(wav|mp3|flac|mp4|mkv|avi|ogg|mov)$/i.test(file.originalname);
+            const autoFolder = isMedia ? 'media' : userTargetFolder;
+            const destDir = path.join(STORAGE_ROOT, autoFolder);
+            if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+
             await sdk.compressFile(file.path, destDir, file.originalname, taskId, onProgress, precisionMode, computeDevice, parallelEnabled);
             if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
         }
@@ -263,7 +263,7 @@ app.post('/api/fs/upload-async', upload.any(), async (req, res) => {
             activeTasks[taskId].progress = 100;
             activeTasks[taskId].log = 'Neural parameterization complete!';
             activeTasks[taskId].status = 'completed';
-            setTimeout(() => { delete activeTasks[taskId]; }, 4000);
+            setTimeout(() => { delete activeTasks[taskId]; }, 3000);
         }
 
     } catch (error) {
