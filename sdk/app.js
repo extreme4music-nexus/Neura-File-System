@@ -10,11 +10,9 @@ const PYTHON_API_URL = process.env.PYTHON_API_URL || 'http://localhost:8000';
 
 const sdk = new HyperCompressorSDK(PYTHON_API_URL);
 
-// Synced storage paths matching server.py architecture
 const STORAGE_ROOT = path.join(__dirname, '..', 'storage');
 const TEMP_ROOT = path.join(STORAGE_ROOT, '.temp');
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
-const TEMP_DIR = TEMP_ROOT;
 
 const activeTasks = {};
 
@@ -22,7 +20,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(PUBLIC_DIR));
 
-const upload = multer({ dest: TEMP_DIR });
+const upload = multer({ dest: TEMP_ROOT });
 
 function initializeDirectories() {
     [
@@ -74,48 +72,27 @@ function buildDirectoryTree(dirPath, relativePath = '') {
                 const header = sdk.readHcsHeader(itemAbsPath);
                 const stats = fs.statSync(itemAbsPath);
 
-                if (header.type === 'folder_bundle') {
-                    const childNodes = (header.files || []).map(f => ({
-                        name: f.original_name,
-                        hcs_file_name: item.name,
-                        sub_path: f.relative_path,
-                        path: `${itemRelPath}?subpath=${encodeURIComponent(f.relative_path)}`,
-                        type: 'file',
-                        file_category: (f.type === 'neural_media' || f.type === 'neural_video') ? 'media' : 'document',
-                        original_size: f.original_size,
-                        compressed_size: Math.round(stats.size / (header.files.length || 1)),
-                        created_at: header.created_at,
-                        compression_ratio: `${((1 - stats.size / (header.original_size || stats.size)) * 100).toFixed(2)}%`
-                    }));
+                const originalName = header.original_filename || header.original_name || item.name.slice(0, -4);
+                const isMedia = (header.type === 'neural_media' || header.type === 'neural_video') ||
+                                /\.(wav|mp3|flac|mp4|mkv|avi)$/i.test(originalName);
 
-                    tree.push({
-                        name: header.folder_name,
-                        path: itemRelPath,
-                        type: 'folder',
-                        children: childNodes
-                    });
-                } else {
-                    const originalName = header.original_filename || header.original_name || item.name.slice(0, -4);
-                    const isMedia = (header.type === 'neural_media' || header.type === 'neural_video') ||
-                                    /\.(wav|mp3|flac|mp4|mkv|avi)$/i.test(originalName);
+                const origSize = header.original_size || stats.size * 2;
+                const compSize = stats.size;
+                const ratioVal = origSize > compSize ? ((1 - compSize / origSize) * 100).toFixed(1) + '%' : '1:1';
 
-                    const origSize = header.original_size || stats.size;
-                    const compSize = stats.size;
-                    const ratioVal = origSize > compSize ? ((1 - compSize / origSize) * 100).toFixed(1) + '%' : '1:1';
-
-                    tree.push({
-                        name: originalName,
-                        hcs_file_name: item.name,
-                        path: itemRelPath,
-                        type: 'file',
-                        file_category: isMedia ? 'media' : 'document',
-                        original_size: origSize,
-                        compressed_size: compSize,
-                        created_at: header.created_at || stats.birthtime,
-                        compression_ratio: ratioVal
-                    });
-                }
+                tree.push({
+                    name: originalName,
+                    hcs_file_name: item.name,
+                    path: itemRelPath,
+                    type: 'file',
+                    file_category: isMedia ? 'media' : 'document',
+                    original_size: origSize,
+                    compressed_size: compSize,
+                    created_at: header.created_at || stats.birthtime,
+                    compression_ratio: ratioVal
+                });
             } catch (err) {
+                // Ignore corrupted or unreadable hcs files to prevent crash
                 continue;
             }
         }
@@ -123,7 +100,7 @@ function buildDirectoryTree(dirPath, relativePath = '') {
     return tree;
 }
 
-// REST API Endpoints
+// REST API Endpoints за UI-то
 app.get('/api/fs/tree', (req, res) => {
     try {
         const tree = buildDirectoryTree(STORAGE_ROOT);
@@ -162,6 +139,8 @@ app.delete('/api/fs/item', (req, res) => {
             fs.unlinkSync(absPath + '.hcs');
         } else if (fs.existsSync(absPath)) {
             fs.rmSync(absPath, { recursive: true, force: true });
+        } else if (fs.existsSync(absPath)) {
+            fs.unlinkSync(absPath);
         } else {
             return res.status(404).json({ error: 'Item not found' });
         }
@@ -205,16 +184,14 @@ app.post('/api/fs/upload-async', upload.any(), async (req, res) => {
     const precisionMode = req.body.precisionMode || 'auto';
     const computeDevice = req.body.computeDevice || 'cpu';
     const parallelEnabled = req.body.parallelEnabled !== 'false';
-
-    const relativePaths = [].concat(req.body.relativePaths || req.body.relativePath || []);
     const userTargetFolder = req.body.targetFolder || 'documents';
-    const isFolderBundle = files.length > 1 || relativePaths.length > 0;
 
+    const file = files[0];
     res.json({ status: 'processing', taskId, message: 'Neural parameterization initiated' });
 
     activeTasks[taskId] = {
         id: taskId,
-        fileName: isFolderBundle ? 'Folder Bundle' : files[0].originalname,
+        fileName: file.originalname,
         progress: 5,
         log: `Initiating Neural Parameterization...`,
         logsHistory: [`[NeuraFS Node.js] Mode: ${precisionMode.toUpperCase()} | Device: ${computeDevice.toUpperCase()}`],
@@ -222,44 +199,52 @@ app.post('/api/fs/upload-async', upload.any(), async (req, res) => {
     };
 
     try {
-        const onProgress = (progressPercent, statusLog, pythonLogs) => {
+        // Директно проследување кон Python FastAPI енџинот за да го генерира точниот .hcs фајл во storage
+        const formData = new FormData();
+        const fileStream = fs.readFileSync(file.path);
+        const blob = new Blob([fileStream], { type: 'application/octet-stream' });
+        formData.append('file', blob, file.originalname);
+        formData.append('task_id', taskId);
+        formData.append('precision_mode', precisionMode);
+        formData.append('compute_device', computeDevice);
+        formData.append('parallel_enabled', String(parallelEnabled));
+
+        const startRes = await fetch(`${PYTHON_API_URL}/api/v1/encode-neural-media-start`, {
+            method: 'POST',
+            body: formData
+        });
+
+        if (!startRes.ok) throw new Error(`API Error [Neural Start]: ${startRes.statusText}`);
+
+        while (true) {
+            await new Promise(r => setTimeout(r, 600));
             if (activeTasks[taskId] && activeTasks[taskId].status === 'cancelled') {
+                await fetch(`${PYTHON_API_URL}/api/v1/task-cancel/${taskId}`, { method: 'POST' });
                 throw new Error('Task cancelled by user.');
             }
+
+            const statusRes = await fetch(`${PYTHON_API_URL}/api/v1/task-status/${taskId}`);
+            const statusData = await statusRes.json();
+
             activeTasks[taskId] = {
                 id: taskId,
-                fileName: isFolderBundle ? 'Folder Bundle' : files[0].originalname,
-                progress: progressPercent,
-                log: statusLog,
-                logsHistory: ['[NeuraFS Node.js] Processing Neural Subbands...', ...(pythonLogs || [])],
-                status: 'running'
+                fileName: file.originalname,
+                progress: statusData.progress || 10,
+                log: statusData.log || 'Processing...',
+                logsHistory: statusData.logsHistory || [],
+                status: statusData.status
             };
-        };
 
-        if (isFolderBundle && files.length > 1) {
-            const folderName = relativePaths[0] ? relativePaths[0].split('/')[0] : 'Uploaded_Folder';
-            const fileItems = files.map((f, i) => ({
-                tempFilePath: f.path,
-                originalName: f.originalname,
-                relativePath: relativePaths[i] || f.originalname
-            }));
-
-            const destDir = path.join(STORAGE_ROOT, userTargetFolder);
-            await sdk.compressFolderBundle(fileItems, destDir, folderName, taskId, onProgress, precisionMode, computeDevice, parallelEnabled);
-            fileItems.forEach(f => { if (fs.existsSync(f.tempFilePath)) fs.unlinkSync(f.tempFilePath); });
-
-        } else {
-            const file = files[0];
-            const isMedia = /\.(wav|mp3|flac|mp4|mkv|avi|ogg|mov)$/i.test(file.originalname);
-            const autoFolder = isMedia ? 'media' : userTargetFolder;
-            const destDir = path.join(STORAGE_ROOT, autoFolder);
-            if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
-
-            await sdk.compressFile(file.path, destDir, file.originalname, taskId, onProgress, precisionMode, computeDevice, parallelEnabled);
-            if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+            if (statusData.status === 'completed') {
+                break;
+            } else if (statusData.status === 'failed' || statusData.status === 'cancelled') {
+                throw new Error(statusData.log || 'Neural encoding failed.');
+            }
         }
 
-        if (activeTasks[taskId] && activeTasks[taskId].status !== 'cancelled') {
+        if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+
+        if (activeTasks[taskId]) {
             activeTasks[taskId].progress = 100;
             activeTasks[taskId].log = 'Neural parameterization complete!';
             activeTasks[taskId].status = 'completed';
@@ -267,7 +252,7 @@ app.post('/api/fs/upload-async', upload.any(), async (req, res) => {
         }
 
     } catch (error) {
-        files.forEach(f => { if (fs.existsSync(f.path)) fs.unlinkSync(f.path); });
+        if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
         if (activeTasks[taskId]) {
             if (activeTasks[taskId].status === 'cancelled') {
                 setTimeout(() => { delete activeTasks[taskId]; }, 1000);
@@ -283,15 +268,11 @@ app.get('/api/fs/stream', async (req, res) => {
     const rawPath = req.query.path;
     if (!rawPath) return res.status(400).send('File path required');
 
-    const pathParts = rawPath.split('?subpath=');
-    const relPath = pathParts[0];
-    const subPath = pathParts[1] ? decodeURIComponent(pathParts[1]) : null;
-
-    const absPath = path.join(STORAGE_ROOT, relPath);
+    const absPath = path.join(STORAGE_ROOT, rawPath);
     if (!fs.existsSync(absPath)) return res.status(404).send('File not found');
 
     try {
-        const { buffer, originalName } = await sdk.decompressToBuffer(absPath, subPath);
+        const { buffer, originalName } = await sdk.decompressToBuffer(absPath);
         const ext = path.extname(originalName).toLowerCase();
         let contentType = 'application/octet-stream';
 
@@ -313,15 +294,11 @@ app.get('/api/fs/download/raw', async (req, res) => {
     const rawPath = req.query.path;
     if (!rawPath) return res.status(400).send('File path required');
 
-    const pathParts = rawPath.split('?subpath=');
-    const relPath = pathParts[0];
-    const subPath = pathParts[1] ? decodeURIComponent(pathParts[1]) : null;
-
-    const absPath = path.join(STORAGE_ROOT, relPath);
+    const absPath = path.join(STORAGE_ROOT, rawPath);
     if (!fs.existsSync(absPath)) return res.status(404).send('File not found');
 
     try {
-        const { buffer, originalName } = await sdk.decompressToBuffer(absPath, subPath);
+        const { buffer, originalName } = await sdk.decompressToBuffer(absPath);
         res.setHeader('Content-Type', 'application/octet-stream');
         res.setHeader('Content-Disposition', `attachment; filename="${originalName}"`);
         res.send(buffer);
@@ -334,8 +311,7 @@ app.get('/api/fs/download/compressed', (req, res) => {
     const rawPath = req.query.path;
     if (!rawPath) return res.status(400).send('File path required');
 
-    const cleanPath = rawPath.split('?')[0];
-    const absPath = path.join(STORAGE_ROOT, cleanPath);
+    const absPath = path.join(STORAGE_ROOT, rawPath);
     if (!fs.existsSync(absPath)) return res.status(404).send('File not found');
 
     const fileName = path.basename(absPath);
