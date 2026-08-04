@@ -10,7 +10,9 @@ const PYTHON_API_URL = process.env.PYTHON_API_URL || 'http://localhost:8000';
 
 const sdk = new HyperCompressorSDK(PYTHON_API_URL);
 
+// Synced storage paths matching server.py architecture
 const STORAGE_ROOT = path.join(__dirname, '..', 'storage');
+const TEMP_ROOT = path.join(STORAGE_ROOT, '.temp');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const TEMP_DIR = path.join(__dirname, 'temp');
 
@@ -23,7 +25,14 @@ app.use(express.static(PUBLIC_DIR));
 const upload = multer({ dest: TEMP_DIR });
 
 function initializeDirectories() {
-    [STORAGE_ROOT, path.join(STORAGE_ROOT, 'media'), path.join(STORAGE_ROOT, 'documents'), PUBLIC_DIR, TEMP_DIR].forEach(dir => {
+    [
+        STORAGE_ROOT,
+        TEMP_ROOT,
+        path.join(STORAGE_ROOT, 'media'),
+        path.join(STORAGE_ROOT, 'documents'),
+        PUBLIC_DIR,
+        TEMP_DIR
+    ].forEach(dir => {
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     });
 }
@@ -32,7 +41,11 @@ function calculateFolderSize(dirPath) {
     if (!fs.existsSync(dirPath)) return 0;
     let total = 0;
     const items = fs.readdirSync(dirPath, { withFileTypes: true });
+
     for (const item of items) {
+        // Skip hidden directories/files (like .temp)
+        if (item.name.startsWith('.')) continue;
+
         const abs = path.join(dirPath, item.name);
         if (item.isDirectory()) total += calculateFolderSize(abs);
         else total += fs.statSync(abs).size;
@@ -46,6 +59,9 @@ function buildDirectoryTree(dirPath, relativePath = '') {
     const tree = [];
 
     for (const item of items) {
+        // 🚫 Completely skip hidden folders like .temp and hidden system files
+        if (item.name.startsWith('.')) continue;
+
         const itemRelPath = path.join(relativePath, item.name).replace(/\\/g, '/');
         const itemAbsPath = path.join(dirPath, item.name);
 
@@ -62,17 +78,17 @@ function buildDirectoryTree(dirPath, relativePath = '') {
                 const stats = fs.statSync(itemAbsPath);
 
                 if (header.type === 'folder_bundle') {
-                    const childNodes = header.files.map(f => ({
+                    const childNodes = (header.files || []).map(f => ({
                         name: f.original_name,
                         hcs_file_name: item.name,
                         sub_path: f.relative_path,
                         path: `${itemRelPath}?subpath=${encodeURIComponent(f.relative_path)}`,
                         type: 'file',
-                        file_category: f.type === 'neural_media' ? 'media' : 'document',
+                        file_category: (f.type === 'neural_media' || f.type === 'neural_video') ? 'media' : 'document',
                         original_size: f.original_size,
-                        compressed_size: Math.round(stats.size / header.files.length),
+                        compressed_size: Math.round(stats.size / (header.files.length || 1)),
                         created_at: header.created_at,
-                        compression_ratio: `${((1 - stats.size / header.original_size) * 100).toFixed(2)}%`
+                        compression_ratio: `${((1 - stats.size / (header.original_size || stats.size)) * 100).toFixed(2)}%`
                     }));
 
                     tree.push({
@@ -82,28 +98,36 @@ function buildDirectoryTree(dirPath, relativePath = '') {
                         children: childNodes
                     });
                 } else {
-                    const originalName = header.original_name || item.name;
+                    const originalName = header.original_filename || header.original_name || item.name.slice(0, -4);
+                    const isMedia = (header.type === 'neural_media' || header.type === 'neural_video') ||
+                                    /\.(wav|mp3|flac|mp4|mkv|avi)$/i.test(originalName);
+
+                    const origSize = header.original_size || stats.size;
+                    const compSize = stats.size;
+                    const ratioVal = origSize > compSize ? ((1 - compSize / origSize) * 100).toFixed(1) + '%' : '1:1';
+
                     tree.push({
                         name: originalName,
                         hcs_file_name: item.name,
                         path: itemRelPath,
                         type: 'file',
-                        file_category: header.type === 'neural_media' ? 'media' : 'document',
-                        original_size: header.original_size || stats.size,
-                        compressed_size: stats.size,
+                        file_category: isMedia ? 'media' : 'document',
+                        original_size: origSize,
+                        compressed_size: compSize,
                         created_at: header.created_at || stats.birthtime,
-                        compression_ratio: `${((1 - stats.size / (header.original_size || stats.size)) * 100).toFixed(2)}%`
+                        compression_ratio: ratioVal
                     });
                 }
             } catch (err) {
-                console.warn(`[VFS Warning] Skipping non-standard or corrupt file '${itemAbsPath}':`, err.message);
+                // Gracefully ignore incomplete or invalid JSON containers without printing warnings
+                continue;
             }
         }
     }
     return tree;
 }
 
-// REST Endpoints
+// REST API Endpoints
 app.get('/api/fs/tree', (req, res) => {
     try {
         const tree = buildDirectoryTree(STORAGE_ROOT);
@@ -137,9 +161,15 @@ app.delete('/api/fs/item', (req, res) => {
 
         const cleanPath = targetPath.split('?')[0];
         const absPath = path.join(STORAGE_ROOT, cleanPath);
-        if (!fs.existsSync(absPath)) return res.status(404).json({ error: 'Item not found' });
+        
+        if (fs.existsSync(absPath + '.hcs')) {
+            fs.unlinkSync(absPath + '.hcs');
+        } else if (fs.existsSync(absPath)) {
+            fs.rmSync(absPath, { recursive: true, force: true });
+        } else {
+            return res.status(404).json({ error: 'Item not found' });
+        }
 
-        fs.rmSync(absPath, { recursive: true, force: true });
         res.json({ status: 'success', message: 'Item deleted successfully' });
     } catch (error) {
         res.status(500).json({ error: error.message });
